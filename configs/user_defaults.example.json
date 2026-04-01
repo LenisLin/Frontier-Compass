@@ -1,0 +1,12 @@
+{
+  "default_mode": "biomedical-latest",
+  "default_report_mode": "deterministic",
+  "default_max_results": 80,
+  "default_zotero_export_path": "../exports/zotero-export.csl.json",
+  "default_email_to": [
+    "reviewer@example.com"
+  ],
+  "default_email_from": "frontier@example.com",
+  "default_generate_dry_run_email": true,
+  "default_allow_stale_cache": true
+}

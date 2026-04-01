@@ -1,0 +1,46 @@
+[
+  {
+    "id": "item-1",
+    "type": "article-journal",
+    "title": "Spatial transcriptomics atlas mapping for tumor microenvironment studies",
+    "abstract": "Single-cell and pathology integration for tissue profiling in cancer cohorts.",
+    "keyword": "spatial transcriptomics; tumor microenvironment; single-cell atlas"
+  },
+  {
+    "id": "item-2",
+    "type": "article-journal",
+    "title": "Digital pathology models for histopathology biomarker discovery",
+    "abstract": "Whole-slide microscopy workflows for clinical tissue analysis and biomarker review.",
+    "keyword": [
+      "digital pathology",
+      "histopathology",
+      "whole-slide imaging"
+    ]
+  },
+  {
+    "id": "item-3",
+    "type": "article-journal",
+    "title": "Protein structure priors for biomolecular drug discovery",
+    "abstract": "Protein representation learning for ligand binding and structure-guided therapeutics.",
+    "keywords": [
+      "protein structure",
+      "drug discovery",
+      "biomolecular modeling"
+    ],
+    "tags": [
+      {
+        "tag": "protein therapeutics"
+      },
+      {
+        "tag": "precision medicine"
+      }
+    ]
+  },
+  {
+    "id": "item-4",
+    "type": "paper-conference",
+    "title": "Benchmarking graph neural network pretraining for code generation",
+    "abstract": "A generic machine learning benchmark paper for software tasks.",
+    "keyword": "benchmark; graph neural networks; code generation"
+  }
+]

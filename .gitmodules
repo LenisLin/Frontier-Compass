@@ -1,0 +1,6 @@
+[submodule "reference/neozot-py"]
+	path = reference/neozot-py
+	url = git@github.com:v-i-s-h/neozot-py.git
+[submodule "reference/zotero-arxiv-daily"]
+	path = reference/zotero-arxiv-daily
+	url = git@github.com:TideDra/zotero-arxiv-daily.git
