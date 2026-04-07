@@ -1,12 +1,16 @@
 {
-  "default_mode": "biomedical-latest",
+  "default_mode": "biomedical",
   "default_report_mode": "deterministic",
-  "default_max_results": 80,
+  "default_max_results": 100,
+  "default_zotero_db_path": "/home/lenislin/Software/Zotero/zotero.sqlite",
   "default_zotero_export_path": "../exports/zotero-export.csl.json",
   "default_email_to": [
     "reviewer@example.com"
   ],
   "default_email_from": "frontier@example.com",
   "default_generate_dry_run_email": true,
-  "default_allow_stale_cache": true
+  "default_allow_stale_cache": true,
+  "default_llm_base_url": "https://api.openai.com/v1",
+  "default_llm_api_key": "set-me-locally",
+  "default_llm_model": "gpt-5-mini"
 }

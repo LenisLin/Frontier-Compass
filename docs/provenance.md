@@ -2,17 +2,17 @@
 
 FrontierCompass writes local artifacts and keeps enough metadata to explain what you are looking at. This page is the user-facing reference for freshness, dates, source labels, and runtime labels.
 
-For requirements that depend on real network behavior, this page is not the final closure gate. Static code review and deterministic tests are necessary, but the documented live checks in [live_validation.md](live_validation.md) are also required before treating multisource truthfulness, cache-fallback behavior, or source-stability claims as closed.
+For requirements that depend on real network behavior, this page is not the final closure gate. Static code review and deterministic tests are necessary, but the documented live checks in [live_validation.md](live_validation.md) are also required before treating source-truthfulness, cache-fallback behavior, or source-stability claims as closed.
 
 ## Requested Date And Effective Displayed Date
 
 The `requested date` is the day you asked FrontierCompass to review. The `effective displayed date` is the day the displayed paper set actually comes from.
 
-In the current bundle-centric workflow, those dates usually match because the default `biomedical` and `ai-for-medicine` bundles read from one saved per-day local snapshot. Older compatibility modes such as `biomedical-latest` can still diverge when they fall back to an earlier effective release date, and that difference stays visible in the Python result, CLI output, JSON cache, HTML report, and local UI.
+In the current public workflow, those dates usually match because the default path uses one fixed per-day local snapshot family across `arXiv` and `bioRxiv`. Older compatibility modes such as `biomedical-latest` can still diverge when they fall back to an earlier effective release date, and that difference stays visible in the Python result, CLI output, JSON cache, HTML report, and local UI.
 
 If a stale-cache fallback is used, the artifact can also record the stale cache's own requested and effective dates so you can see exactly which earlier run is being reused.
 
-For explicit date windows, the artifact also keeps a `request window` contract. A complete range records the requested start and end dates. A partial range can also record completed dates, failed dates, failed sources when known, and the failure reason that stopped or degraded the window.
+For explicit date windows, the artifact also keeps a `request window` contract. A complete range records the requested start and end dates. A partial range can also record completed dates, plus a serialized `failures` list with `date`, `source`, and `reason` entries for every degraded or failed day in the requested window. The older `failed_date`, `failed_source`, and `failure_reason` fields remain as first-failure compatibility shorthands.
 
 ## Fetch Status And Artifact Source
 
@@ -32,31 +32,34 @@ The `Artifact source` label intentionally compresses the story a bit. For exampl
 
 ## Source Provenance
 
-The public source story is bundle-centric. The official `biomedical` and `ai-for-medicine` bundles both read from one local per-day snapshot family covering `arXiv`, `bioRxiv`, and `medRxiv`.
+The public source story is bundle-first. The default `run-daily` and `ui` path uses the `biomedical` bundle, which reads from one local per-day snapshot family covering `arXiv` and `bioRxiv`. `medRxiv` remains available only through explicit compatibility or advanced workflows such as `biomedical-multisource`.
 
 The saved report and UI surfaces can expose source-level provenance such as:
 
-- selected mode or category
+- selected source run or advanced override id
 - searched categories
 - source counts
 - source endpoints or feed URLs when applicable
 - profile basis, including whether Zotero augmentation was active
 
-This lets you distinguish a default bundle run, a custom bundle run, or an older compatibility mode. The `history` view focuses on the compact persisted run summary and source counts; it does not promise to surface the raw source endpoints or feed URLs.
+This lets you distinguish the default public 2-source bundle, an advanced bundle override, or an older compatibility mode. The `history` view focuses on the compact persisted run summary and source counts; it does not promise to surface the raw source endpoints or feed URLs.
 
-For multisource and range runs, the source rows are meant to stay honest even when a source returns nothing or fails. A `0` row should stay visible, and partial or failed source states should stay attached to that source rather than disappearing into aggregate totals.
+For bundle, compatibility, and range runs, the source rows are meant to stay honest even when a source returns nothing or fails. A `0` row should stay visible, and partial or failed source states should stay attached to that source rather than disappearing into aggregate totals. The default product path keeps `arXiv` and `bioRxiv` visible in source composition across CLI, UI, HTML, and history. Compatibility-only runs may additionally show `medRxiv`, and older artifacts that include `medRxiv` remain readable as historical or compatibility outputs rather than as the current release contract.
+
+Source rows also distinguish the current provenance state rather than flattening everything into "success". The normalized outcomes are at least `live-success`, `live-zero`, `live-failed`, `same-day-cache`, `stale-cache`, and `unknown-legacy`.
 
 ## Profile Basis Provenance
 
 `Profile source` records which local basis was used to build the current profile:
 
 - `baseline`: default biomedical keyword profile, no Zotero augmentation
-- `zotero`: augmented from the reusable local Zotero export snapshot
-- `zotero_export` and `live_zotero_db`: compatibility aliases that can still appear in older artifacts or explicit legacy requests
+- `zotero_export`: augmented from the reusable local Zotero export snapshot
+- `live_zotero_db`: augmented directly from the local read-only Zotero SQLite database
+- legacy aliases such as `zotero` and `zotero-profile` remain readable in older artifacts and normalize to `zotero_export`
 
-The primary user-facing Zotero path is now export-backed: FrontierCompass auto-discovers a local read-only Zotero SQLite library when available, exports it to `data/raw/zotero/library.csl.json`, and reuses that snapshot until you refresh it. Zotero-derived keywords, concepts, retrieval hints, and optional collection selections are then merged into the baseline profile. FrontierCompass reads the SQLite library in read-only mode and does not write back to Zotero.
+`zotero_export` is the reusable-snapshot path: FrontierCompass can auto-discover a local read-only Zotero SQLite library, export it to `data/raw/zotero/library.csl.json`, and reuse that snapshot until you refresh it. `live_zotero_db` is the direct read-only DB path: it reads the SQLite library in place, preserves DB provenance, and fails clearly if the DB is unavailable or unreadable. Neither path writes back to Zotero.
 
-When a Zotero basis is active, the artifact carries the reusable export filename, selected collections when present, and parsed and used item counts. Older artifacts can still carry the original read-only SQLite filename.
+When a Zotero basis is active, the artifact carries the explicit source, the relevant export filename or SQLite filename, selected collections when present, and parsed and used item counts.
 
 ## Report Mode And Cost Mode
 
@@ -76,13 +79,15 @@ If you request `--report-mode enhanced` today, FrontierCompass still records tha
 
 `range-full` is the explicit window contract for date ranges specified via `--start-date` and `--end-date`. It iterates each day in the range, builds a per-day digest, and merges the papers into a single ranked pool. `shortlist` remains a supported CLI option for compact previews. `day-full` and `range-full` keep the full ranked output, while `shortlist` uses `--max-results` as the shortlist ceiling.
 
-A partial range run records which dates completed, which date failed, which source failed (when known), and the failure reason. The merged ranked output still includes papers from all completed dates.
+A partial range run records which dates completed, and it keeps explicit per-failure records for failed dates, failed sources when known, and failure reasons. `range-full` iterates the entire requested window instead of stopping at the first failed day, and the merged ranked output still includes papers from all completed dates.
+
+Cache provenance and timing provenance stay separate. Same-day cache reuse and stale fallback do not relabel a source as fresh live success, and the saved run timings preserve cache lookup/load separately from network, parse, rank, and report stages.
 
 ## Output Files
 
 FrontierCompass keeps runtime artifacts out of the repository root:
 
-- `data/raw/source_snapshots/`: normalized per-day source snapshots for `arXiv`, `bioRxiv`, and `medRxiv`
+- `data/raw/source_snapshots/`: normalized per-day source snapshots for the active run sources. Public default runs materialize `arXiv` and `bioRxiv`; compatibility runs may also materialize `medRxiv`.
 - `data/raw/zotero/`: reusable Zotero export snapshot plus discovery/status sidecar
 - `data/cache/`: JSON cache artifacts for daily runs
 - `reports/daily/`: saved HTML reports
@@ -92,4 +97,4 @@ The `history` command reads the same artifact family and shows the same provenan
 
 ## Validation Gate
 
-Use the live-validation guide in [live_validation.md](live_validation.md) when you need to confirm the current shipped path against real source behavior. That guide covers `frontier-compass run-daily`, `frontier-compass ui`, and `frontier-compass history`, plus the current contracts for bundle ids, `--profile-source zotero`, `--zotero-db-path`, `--zotero-collection`, `--start-date`, `--end-date`, and `--fetch-scope`.
+Use the live-validation guide in [live_validation.md](live_validation.md) when you need to confirm the current shipped path against real source behavior. That guide covers `frontier-compass run-daily`, `frontier-compass ui`, and `frontier-compass history`, plus the current contracts for bundle ids, `--profile-source zotero_export`, `--profile-source live_zotero_db`, `--zotero-db-path`, `--zotero-collection`, `--start-date`, `--end-date`, and `--fetch-scope`.
