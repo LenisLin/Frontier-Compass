@@ -1,141 +1,285 @@
 <div align="center">
   <h1>FrontierCompass</h1>
-  <p><strong>A local research-scouting workflow for new biomedical papers.</strong></p>
-  <p>Two product tracks. Three local surfaces. Provenance-honest daily artifacts.</p>
+  <p><strong>A local-first research scouting desk for daily biomedical reading.</strong></p>
+  <p><strong>一个面向生物医学文献筛读的本地优先研究工作台。</strong></p>
 </div>
 
 <p align="center">
-  <a href="#quickstart">Quickstart</a> ·
-  <a href="#at-a-glance">At a Glance</a> ·
-  <a href="#choose-your-surface">Choose Your Surface</a> ·
-  <a href="#supported-bundles-and-snapshots">Bundles and Snapshots</a> ·
-  <a href="#runtime-outputs-and-provenance">Runtime and Provenance</a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-1f6feb?style=flat-square">
+  <img alt="UI" src="https://img.shields.io/badge/UI-Streamlit-0f766e?style=flat-square">
+  <img alt="Mode" src="https://img.shields.io/badge/Mode-Local--First-c2410c?style=flat-square">
+  <img alt="Focus" src="https://img.shields.io/badge/Focus-Biomedical%20Reading-7c3aed?style=flat-square">
 </p>
 
-FrontierCompass is a local research-scouting tool for reviewing new biomedical papers from your own machine. It fetches paper metadata, ranks a reading-first shortlist, writes local artifacts, and lets you inspect the same run from Python, the CLI, or a local Streamlit UI.
+<p align="center">
+  <a href="#why-frontiercompass">Why FrontierCompass</a> ·
+  <a href="#3-minute-quickstart">3-Minute Quickstart</a> ·
+  <a href="#choose-your-surface">Choose Your Surface</a> ·
+  <a href="#typical-daily-workflow">Daily Workflow</a> ·
+  <a href="#personalization-with-zotero">Zotero</a> ·
+  <a href="#docs">Docs</a>
+</p>
 
-What makes the product legible is that each run keeps two product tracks separate instead of blending everything into one undifferentiated report. The `Personalized Digest` answers what you should look at first. The `Frontier Report` answers what surfaced in the field today. The saved JSON cache, HTML report, and interactive UI all describe the same run and the same provenance story.
+FrontierCompass helps you review what is new in biomedical research without leaving your own machine. It materializes a local daily run, keeps cache and HTML artifacts under predictable folders, and lets you read the result from a Streamlit homepage, a CLI workflow, or a small Python API.
 
-## At a Glance
+FrontierCompass 让你在本地完成“抓取新论文 -> 生成日报 -> 个性化排序 -> 回看历史”的整套流程。它不是托管服务，不依赖后台任务，也不把运行产物散落到仓库根目录。
 
-| Layer | What it gives you |
-| --- | --- |
-| `Personalized Digest` | A profile-aware shortlist for what to read first |
-| `Frontier Report` | A broader field summary of what surfaced in the run |
-| `Python API` | The shortest programmable entrypoint for local automation |
-| `local CLI` | The primary day-to-day command-line path |
-| `local interactive UI` | A local Streamlit view over the same digest and report |
-| Local artifacts | JSON caches in `data/cache/` and HTML reports in `reports/daily/` |
-| Provenance | Requested date, effective displayed date, fetch status, artifact source, report mode, cost mode, and profile basis |
+> [!TIP]
+> The intended first experience is simple: configure Zotero once, run `frontier-compass ui`, read the three lanes, and reopen artifacts only when you need to inspect provenance.
 
-## Quickstart
+> [!NOTE]
+> Local defaults in `configs/user_defaults.json` and runtime artifacts under `data/` are kept out of normal Git commits. FrontierCompass is designed to be shareable as code, not to leak your local reading state.
 
-If you only want the shortest supported local workflow, install the editable package, materialize a run, and then open the UI:
+## Why FrontierCompass
+
+<table>
+  <tr>
+    <td width="33%">
+      <strong>Read First</strong><br><br>
+      Open one page, scan the field-wide report, then move into your Zotero-aware lane and the peripheral signals.<br><br>
+      <strong>阅读优先：</strong>先看领域全貌，再看个性化推荐，而不是先陷进参数配置。
+    </td>
+    <td width="33%">
+      <strong>Stay Local</strong><br><br>
+      Cache, report, and provenance artifacts live under predictable folders instead of disappearing into a hosted backend.<br><br>
+      <strong>本地优先：</strong>产物可复现、可回看、可调试。
+    </td>
+    <td width="33%">
+      <strong>Personalize Lightly</strong><br><br>
+      Bring your Zotero library if you have it. Skip it if you do not. The baseline path still works.<br><br>
+      <strong>轻量个性化：</strong>有 Zotero 更好，没有也能直接开始。
+    </td>
+  </tr>
+</table>
+
+## Experience Snapshot
+
+| You want to... | Use this | Why it is the default |
+| --- | --- | --- |
+| Read today’s frontier quickly | `frontier-compass ui` | Best visual flow for the three report lanes |
+| Materialize a dated artifact | `frontier-compass run-daily --today 2026-04-07` | Reproducible HTML + JSON output |
+| Reopen the last few runs | `frontier-compass history --limit 5` | Fast provenance and artifact lookup |
+| Script the workflow | `from frontier_compass import run_daily` | Small stable public API |
+
+## 3-Minute Quickstart
+
+### 1. Install
+
+FrontierCompass requires Python `>=3.10`.
 
 ```bash
+git clone <your-repo-url>
+cd FrontierCompass
 pip install -e .
-frontier-compass run-daily --today 2026-03-24
-frontier-compass ui --today 2026-03-24
 ```
 
-`run-daily` is the primary local CLI path. It materializes or reuses the current daily digest, writes the matching HTML report, and keeps provenance visible in the saved artifacts. `ui` opens the local interactive inspection surface for the same workflow. `history` is the normal follow-up command when you want to inspect recent runs, compare requested and displayed dates, or reopen saved artifacts.
+> [!IMPORTANT]
+> FrontierCompass requires Python `>=3.10`.
+
+### 2. Create your local defaults
 
 ```bash
-frontier-compass history --limit 5
-frontier-compass ui --print-command --today 2026-03-24
+cp configs/user_defaults.example.json configs/user_defaults.json
 ```
+
+Edit `configs/user_defaults.json` and set at least one of:
+
+- `default_zotero_db_path`
+- `default_zotero_export_path`
+
+If you do not have Zotero handy yet, you can still start without it. FrontierCompass will use the baseline profile.
+
+如果你暂时还没有准备好 Zotero，也可以先跳过这一步，工具会自动退回到 baseline 模式。
+
+### 3. Open the local UI
+
+```bash
+frontier-compass ui
+```
+
+If the installed entrypoint is unavailable in your shell, this does the same thing:
+
+```bash
+PYTHONPATH=src python -m frontier_compass.cli.main ui
+```
+
+### 4. Optional: materialize a dated run from the CLI
+
+```bash
+frontier-compass run-daily --today 2026-04-07
+frontier-compass history --limit 5
+```
+
+That is the default supported path:
+
+1. install
+2. configure local defaults
+3. open `ui`
+4. optionally use `run-daily` and `history` for reproducible runs
 
 ## Choose Your Surface
 
-The primary supported surfaces are the `Python API`, the `local CLI`, and the `local interactive UI`. They all point at the same underlying local artifact flow, so the saved report, the UI, and the returned Python result stay aligned.
-
 | Surface | Best for | Shortest path |
 | --- | --- | --- |
-| `Python API` | Scripting, notebooks, local automation | `run_daily(...)` |
-| `local CLI` | Fast daily use from the terminal | `frontier-compass run-daily --today 2026-03-24` |
-| `local interactive UI` | Browsing the current run visually | `frontier-compass ui --today 2026-03-24` |
+| Streamlit UI | Daily reading, browsing the three report lanes, inspecting local provenance visually | `frontier-compass ui` |
+| CLI | Reproducible dated runs, automation, artifact generation, history inspection | `frontier-compass run-daily --today 2026-04-07` |
+| Python API | Notebooks, local scripting, wrapping FrontierCompass into another workflow | `from frontier_compass import run_daily` |
 
-The package root and `frontier_compass.api` intentionally expose the same supported public surface: `FrontierCompassRunner`, `DailyRunResult`, `LocalUISession`, `run_daily`, `prepare_ui_session`, and `load_recent_history`.
+The supported public Python surface is:
 
-The shortest supported Python path is the package-root `run_daily()` helper:
+- `run_daily`
+- `prepare_ui_session`
+- `load_recent_history`
+- `FrontierCompassRunner`
+- `DailyRunResult`
+- `LocalUISession`
 
 ```python
 from datetime import date
 
 from frontier_compass import run_daily
 
-result = run_daily(requested_date=date(2026, 3, 24), max_results=80)
+result = run_daily(requested_date=date(2026, 4, 7), max_results=80)
 
-print(result.digest.category)
 print(result.fetch_status_label)
 print(result.cache_path)
 print(result.report_path)
 ```
 
-Use `from frontier_compass.api import run_daily` if you prefer the explicit module path. Use `FrontierCompassRunner` when you want a reusable object-oriented entrypoint or when you want to prepare a `LocalUISession` directly.
+## Typical Daily Workflow
 
-## Zotero Augmentation
-
-FrontierCompass now treats `zotero` as the primary user-facing profile source. The local UI auto-discovers standard local Zotero library locations, exports one reusable `CSL JSON` snapshot to `data/raw/zotero/library.csl.json`, and reuses that export until you explicitly refresh it.
-
-Primary examples:
-
-```bash
-frontier-compass run-daily --today 2026-03-24 --profile-source zotero
-frontier-compass run-daily --today 2026-03-24 --profile-source zotero --zotero-db-path /path/to/zotero.sqlite
-frontier-compass run-daily --today 2026-03-24 --profile-source zotero --zotero-collection "Tumor microenvironment"
+```mermaid
+flowchart LR
+    A[Configure local defaults] --> B[frontier-compass ui]
+    B --> C[Read Daily Full Report]
+    C --> D[Check Most Relevant to Your Zotero]
+    D --> E[Scan Other Frontier Signals]
+    E --> F[Reopen artifacts with history or saved HTML]
 ```
 
-Manual export files still work as a compatibility fallback:
+The default homepage is built around three reading lanes:
 
-```bash
-frontier-compass run-daily --today 2026-03-24 --profile-source zotero --zotero-export path/to/zotero-export.csl.json
-```
+1. `Daily Full Report`
+2. `Most Relevant to Your Zotero`
+3. `Other Frontier Signals`
 
-`zotero_export` and `live_zotero_db` remain compatibility aliases for older scripts, caches, and explicit CLI requests, but new runs normalize to the single `zotero` profile basis. Zotero augmentation stays local-only, personalizes the `Personalized Digest`, surfaces score and retrieval hints in the saved HTML report and UI, and can influence the profile-relevant highlights shown inside the `Frontier Report`. FrontierCompass reads the SQLite library in read-only mode and does not write back to Zotero.
+UI 首屏的重点就是这三块阅读内容，而不是把所有兼容参数直接抛给新用户。
 
-## Supported Bundles And Snapshots
+> [!TIP]
+> If you only try one thing on day one, try reading the lanes in this order: `Daily Full Report` -> `Most Relevant to Your Zotero` -> `Other Frontier Signals`.
 
-FrontierCompass is bundle-centric in the current build. The two official public bundles are:
+## Personalization With Zotero
 
-| Bundle | What it means now |
+FrontierCompass supports three profile bases:
+
+| Profile source | What it means |
 | --- | --- |
-| `biomedical` | Default cross-source biomedical scouting bundle over the saved daily `arXiv` + `bioRxiv` + `medRxiv` snapshot |
-| `ai-for-medicine` | Curated AI-for-medicine local filter over the same saved daily snapshot |
-| custom bundles in `configs/source_bundles.json` | Persistent local presets with enabled sources, include terms, and optional exclude terms |
+| `baseline` | Deterministic default profile, no Zotero augmentation |
+| `zotero_export` | Built from a reusable local `CSL JSON` export snapshot |
+| `live_zotero_db` | Built directly from a readable local Zotero SQLite database |
 
-Both official bundles read from the same local per-day source snapshots under `data/raw/source_snapshots/YYYY-MM-DD/{source}.json`. Switching bundle, profile mode, or Zotero collections in the UI reuses those local day snapshots unless you explicitly refresh data.
+Default resolution order:
 
-Bundle examples:
+1. readable `default_zotero_db_path`
+2. readable `default_zotero_export_path` or reusable snapshot
+3. fallback to `baseline`
+
+Recommended path:
+
+- put your Zotero DB or export path into `configs/user_defaults.json`
+- start `frontier-compass ui`
+- let the app auto-resolve personalization
+
+Advanced overrides remain available:
 
 ```bash
-frontier-compass run-daily --mode biomedical --today 2026-03-24
-frontier-compass run-daily --mode ai-for-medicine --today 2026-03-24
+frontier-compass run-daily --today 2026-04-07 --profile-source baseline
+frontier-compass run-daily --today 2026-04-07 --profile-source zotero_export --zotero-export path/to/library.csl.json
+frontier-compass run-daily --today 2026-04-07 --profile-source live_zotero_db --zotero-db-path /path/to/zotero.sqlite
+frontier-compass run-daily --today 2026-04-07 --profile-source live_zotero_db --zotero-collection "Tumor microenvironment"
 ```
 
-Range example:
+## Runtime Outputs
+
+FrontierCompass keeps runtime artifacts under stable local folders:
+
+| Path | What goes there |
+| --- | --- |
+| `configs/` | checked-in config examples and local user defaults |
+| `data/raw/` | source payloads, Zotero snapshots, and source snapshots |
+| `data/cache/` | JSON cache artifacts for daily runs |
+| `data/db/` | local database files when persistence is added |
+| `reports/daily/` | saved HTML daily reports |
+| `reports/weekly/` | weekly rollups when added |
+
+Runtime outputs should not be written to the repository root.
+
+## Supported Default Path
+
+The default public workflow is intentionally narrow:
+
+- source bundle: `biomedical`
+- default source composition: `arXiv + bioRxiv`
+- primary commands: `ui`, `run-daily`, `history`
+- default report mode: `deterministic`
+- default cost mode: `zero-token`
+
+This keeps v0.1 legible. Compatibility commands such as `daily`, `deliver-daily`, `demo-report`, and `demo-ranking` still exist, but they are not the main onboarding path.
+
+<details>
+<summary><strong>Advanced Paths</strong></summary>
+
+You only need these if the default path is not enough:
+
+- `--mode ai-for-medicine` for an advanced bundle override
+- `--mode biomedical-multisource` for compatibility-only 3-source runs including `medRxiv`
+- `--start-date` and `--end-date` for range runs
+- `--report-mode enhanced` when you explicitly configure an OpenAI-compatible endpoint
+
+Example:
 
 ```bash
-frontier-compass run-daily --mode biomedical --start-date 2026-03-20 --end-date 2026-03-24 --fetch-scope range-full
+frontier-compass run-daily --mode biomedical --start-date 2026-04-01 --end-date 2026-04-07 --fetch-scope range-full
+frontier-compass ui --print-command --today 2026-04-07
 ```
 
-Legacy ids such as `biomedical-latest`, `biomedical-discovery`, `biomedical-daily`, and `biomedical-multisource` still resolve in the CLI/API for compatibility, but they are internal resolver targets rather than the primary user-facing bundle list. The local UI now exposes only the two official bundles plus any saved custom presets.
+</details>
 
-## Runtime, Outputs, And Provenance
+## Docs
 
-The default report runtime is `deterministic`, and the current build is `zero-token` by default. Fetching, ranking, summaries, exploration picks, and the current `Frontier Report` all run with deterministic local logic. `enhanced` is a formalized request mode for the `Frontier Report` track only, but the current build does not ship a model-assisted frontier reporter, so requesting `--report-mode enhanced` still produces a deterministic zero-token run and says so in the saved artifacts.
+- [Getting Started Tutorial](docs/tutorial.md)
+- [Provenance and Runtime Notes](docs/provenance.md)
+- [Live Validation Guide](docs/live_validation.md)
 
-FrontierCompass writes runtime artifacts to stable local locations rather than the repository root. JSON caches land under `data/cache/`. HTML reports land under `reports/daily/`. Optional `.eml` files appear only when you use the compatibility email path or dry-run email output. The persisted cache keeps the underlying digest and provenance fields. The CLI can also print a compressed `Artifact source` label when it differs from the fetch status, while the UI, HTML report, and history surfaces primarily show fetch-status or display-source style provenance from that run data. Each run keeps enough provenance to explain what you are looking at, including requested date, effective displayed date, request-window status, completed dates, failed dates or sources when a range is partial, report mode, cost mode, and profile basis.
+## Git Hygiene
 
-The user-facing provenance model is documented in [docs/provenance.md](docs/provenance.md).
-The live-validation gate for network-touching requirements is documented in [docs/live_validation.md](docs/live_validation.md). Static tests are necessary, but they do not by themselves close multisource truthfulness, cache-fallback, or other real-network acceptance claims.
+The following local-only paths are intentionally excluded from normal commits:
 
-## Optional Local Defaults
+- `configs/user_defaults.json`
+- `data/raw/*`
+- `data/cache/*`
+- `data/db/*`
+- `reports/daily/*`
+- `reports/weekly/*`
 
-If `configs/user_defaults.json` exists, FrontierCompass loads it automatically. Start from [configs/user_defaults.example.json](configs/user_defaults.example.json). CLI flags override config values, and config values override built-ins. The most useful day-to-day defaults are `default_mode`, `default_report_mode`, `default_max_results`, `default_zotero_export_path`, `default_email_to`, `default_email_from`, `default_generate_dry_run_email`, and `default_allow_stale_cache`.
+That lets you publish the project without publishing your private defaults or local runtime artifacts.
 
-## Current Scope
+## FAQ
 
-FrontierCompass is intentionally narrow in this phase. It scouts papers from titles, abstracts, metadata, and optional Zotero-derived signals; there is no full-text reading in the current build. The primary supported path is local: Python API, local CLI, and local interactive UI. `history` is a supported local inspection surface, while `daily`, `deliver-daily`, `demo-report`, and `demo-ranking` remain compatibility or demo commands rather than the main onboarding path.
+### Do I need Zotero before I can use FrontierCompass?
 
-Email delivery is still present as a compatibility surface, but it is secondary to the local artifact workflow. There is no default model-assisted `Frontier Report` in this build. The current surface does not imply a hosted service, background job, scheduler, or daemon process.
+No. Zotero improves personalization, but the baseline profile works out of the box.
+
+### Where do reports go?
+
+Saved HTML reports go to `reports/daily/`. JSON cache artifacts go to `data/cache/`.
+
+### Does this run as a hosted service?
+
+No. FrontierCompass is a local workflow. The optional `enhanced` report mode only becomes model-assisted when you explicitly configure an OpenAI-compatible endpoint.
+
+### What command should most users start with?
+
+`frontier-compass ui`
+
+It is the shortest path to the intended reading experience.
