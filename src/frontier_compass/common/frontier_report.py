@@ -174,6 +174,11 @@ def build_daily_frontier_report(
     enhanced_track: str = "",
     enhanced_item_count: int = 0,
     runtime_note: str = "",
+    llm_requested: bool = False,
+    llm_applied: bool = False,
+    llm_provider: str | None = None,
+    llm_fallback_reason: str | None = None,
+    llm_seconds: float | None = None,
     searched_categories: Sequence[str] = (),
     total_fetched: int = 0,
     field_highlight_limit: int = DEFAULT_FIELD_HIGHLIGHT_LIMIT,
@@ -236,7 +241,7 @@ def build_daily_frontier_report(
         repeated_themes=repeated_themes,
         salient_topics=salient_topics,
         adjacent_themes=adjacent_themes,
-        profile_relevant_highlights=profile_relevant_highlights,
+        field_highlights=field_highlights,
     )
 
     return DailyFrontierReport(
@@ -252,6 +257,11 @@ def build_daily_frontier_report(
         enhanced_track=enhanced_track,
         enhanced_item_count=enhanced_item_count,
         runtime_note=runtime_note,
+        llm_requested=llm_requested,
+        llm_applied=llm_applied,
+        llm_provider=llm_provider,
+        llm_fallback_reason=llm_fallback_reason,
+        llm_seconds=llm_seconds,
         searched_categories=tuple(str(value) for value in searched_categories if str(value)),
         total_fetched=resolved_total_fetched,
         total_ranked=len(papers),
@@ -259,6 +269,8 @@ def build_daily_frontier_report(
         repeated_themes=repeated_themes,
         salient_topics=salient_topics,
         adjacent_themes=adjacent_themes,
+        deterministic_takeaways=takeaways,
+        deterministic_field_highlights=field_highlights,
         takeaways=takeaways,
         field_highlights=field_highlights,
         profile_relevant_highlights=profile_relevant_highlights,
@@ -436,16 +448,16 @@ def _build_takeaways(
     repeated_themes: Sequence[FrontierReportSignal],
     salient_topics: Sequence[FrontierReportSignal],
     adjacent_themes: Sequence[FrontierReportSignal],
-    profile_relevant_highlights: Sequence[FrontierReportHighlight],
+    field_highlights: Sequence[FrontierReportHighlight],
 ) -> tuple[str, ...]:
     if not ranked_papers:
         return (
-            f"Frontier view is empty for the current run: 0 ranked papers from {total_fetched} fetched items.",
+            f"Frontier Report is empty for the current run: 0 ranked papers from {total_fetched} fetched items.",
             "Refresh the current day or inspect a different source to populate the broader field view.",
         )
 
     coverage_line = (
-        f"Frontier view covers {len(ranked_papers)} ranked papers from {total_fetched} fetched items"
+        f"Frontier Report covers {len(ranked_papers)} ranked papers from {total_fetched} fetched items"
         + (
             f" across {len(tuple(dict.fromkeys(str(value) for value in searched_categories if str(value))))} searched categories."
             if searched_categories
@@ -453,32 +465,31 @@ def _build_takeaways(
         )
     )
     source_line = (
-        f"Source mix in this broader pool: {_source_text(source_counts)}."
+        f"Source composition in this broader pool: {_source_text(source_counts)}."
         if source_counts
-        else "Source mix is unavailable for this broader pool."
+        else "Source composition is unavailable for this broader pool."
     )
     theme_line = (
-        f"Repeated themes in the broader pool: {_signal_text(repeated_themes)}."
+        f"Repeated themes / hotspots: {_signal_text(repeated_themes)}."
         if repeated_themes
-        else "Repeated themes are diffuse in the broader pool."
+        else "Repeated themes are diffuse across the broader pool."
     )
     topic_line = (
-        f"Salient methods or topics today: {_signal_text(salient_topics)}."
+        f"Method hotspots today: {_signal_text(salient_topics)}."
         if salient_topics
         else "No single method or topic bucket dominates the broader pool."
     )
+    highlight_line = (
+        f'Important highlight: "{field_highlights[0].title}" - {field_highlights[0].why}'
+        if field_highlights
+        else "No important field-wide highlight was selected from this broader pool."
+    )
     if adjacent_themes:
-        adjacent_line = f"Notable adjacent signals from the wider search surface: {_signal_text(adjacent_themes)}."
+        adjacent_line = f"Adjacent frontier signals: {_signal_text(adjacent_themes)}."
     else:
         adjacent_line = "Adjacent signals are limited; the broader pool stays close to the core biomedical baseline."
-    lines = [coverage_line, source_line, theme_line, topic_line, adjacent_line]
-    if profile_relevant_highlights:
-        lead = profile_relevant_highlights[0]
-        lines.append(
-            f'Secondary profile relevance remains separate here; leading match: "{lead.title}"'
-            + (f" ({lead.score:.3f})." if lead.score is not None else ".")
-        )
-    return tuple(lines[:5])
+    lines = [coverage_line, source_line, theme_line, topic_line, highlight_line, adjacent_line]
+    return tuple(lines[:6])
 
 
 def _field_candidate_sort_key(candidate: _HighlightCandidate) -> tuple[int, int, str]:

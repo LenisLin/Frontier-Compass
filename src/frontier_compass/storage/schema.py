@@ -10,6 +10,7 @@ from typing import Any, Mapping
 from frontier_compass.common.report_mode import (
     DEFAULT_REPORT_MODE,
     ZERO_TOKEN_COST_MODE,
+    backfill_llm_provenance,
 )
 from frontier_compass.common.text_normalization import slugify
 
@@ -19,13 +20,16 @@ PROFILE_SOURCE_ZOTERO_EXPORT = "zotero_export"
 PROFILE_SOURCE_LIVE_ZOTERO_DB = "live_zotero_db"
 PROFILE_SOURCE_CHOICES = (
     PROFILE_SOURCE_BASELINE,
-    PROFILE_SOURCE_ZOTERO,
     PROFILE_SOURCE_ZOTERO_EXPORT,
     PROFILE_SOURCE_LIVE_ZOTERO_DB,
 )
+_PROFILE_SOURCE_ALIASES = {
+    PROFILE_SOURCE_ZOTERO: PROFILE_SOURCE_ZOTERO_EXPORT,
+    "zotero-profile": PROFILE_SOURCE_ZOTERO_EXPORT,
+}
 _PROFILE_SOURCE_LABELS = {
     PROFILE_SOURCE_BASELINE: "Baseline",
-    PROFILE_SOURCE_ZOTERO: "Zotero",
+    PROFILE_SOURCE_ZOTERO: "Zotero Export",
     PROFILE_SOURCE_ZOTERO_EXPORT: "Zotero Export",
     PROFILE_SOURCE_LIVE_ZOTERO_DB: "Live Zotero DB",
 }
@@ -51,9 +55,33 @@ def normalize_profile_source(value: str | None) -> str | None:
         return None
     if normalized in PROFILE_SOURCE_CHOICES:
         return normalized
-    if normalized == "zotero-profile":
-        return PROFILE_SOURCE_ZOTERO
-    return None
+    return _PROFILE_SOURCE_ALIASES.get(normalized)
+
+
+def resolve_requested_profile_source(
+    value: str | None,
+    *,
+    zotero_export_path: str | Path | None = None,
+    zotero_db_path: str | Path | None = None,
+) -> str:
+    normalized = normalize_profile_source(value)
+    if value is not None and normalized is None:
+        raise ValueError(f"Unsupported profile_source: {value}")
+    if normalized is not None:
+        return normalized
+    has_export_path = zotero_export_path is not None
+    has_db_path = zotero_db_path is not None
+    if has_export_path and has_db_path:
+        raise ValueError(
+            "Both a Zotero export path and a Zotero DB path were supplied without an explicit "
+            "profile_source. Choose profile_source='zotero_export' or "
+            "profile_source='live_zotero_db'."
+        )
+    if has_db_path:
+        return PROFILE_SOURCE_LIVE_ZOTERO_DB
+    if has_export_path:
+        return PROFILE_SOURCE_ZOTERO_EXPORT
+    return PROFILE_SOURCE_BASELINE
 
 
 def profile_source_label(value: str | None) -> str:
@@ -161,6 +189,38 @@ class PaperRecord:
 
 
 @dataclass(slots=True, frozen=True)
+class RequestWindowFailure:
+    date: date | None = None
+    source: str = ""
+    reason: str = ""
+
+    @property
+    def label(self) -> str:
+        failed_parts = [f"failed {self.date.isoformat()}" if self.date is not None else "failed unknown-date"]
+        if self.source:
+            failed_parts.append(self.source)
+        label = " / ".join(failed_parts)
+        if self.reason:
+            return f"{label} ({self.reason})"
+        return label
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "date": self.date.isoformat() if self.date is not None else None,
+            "source": self.source,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, Any]) -> "RequestWindowFailure":
+        return cls(
+            date=_parse_date(payload.get("date")),
+            source=str(payload.get("source", "")),
+            reason=str(payload.get("reason", "")),
+        )
+
+
+@dataclass(slots=True, frozen=True)
 class RequestWindow:
     kind: str = "day"
     requested_date: date | None = None
@@ -168,6 +228,7 @@ class RequestWindow:
     end_date: date | None = None
     status: str = "complete"
     completed_dates: tuple[date, ...] = ()
+    failures: tuple[RequestWindowFailure, ...] = ()
     failed_date: date | None = None
     failed_source: str = ""
     failure_reason: str = ""
@@ -216,6 +277,25 @@ class RequestWindow:
         return len(self.completed_dates)
 
     @property
+    def failure_entries(self) -> tuple[RequestWindowFailure, ...]:
+        if self.failures:
+            return self.failures
+        legacy_failure = _build_request_window_failure(
+            failed_date=self.failed_date,
+            failed_source=self.failed_source,
+            failure_reason=self.failure_reason,
+        )
+        if legacy_failure is None:
+            return ()
+        return (legacy_failure,)
+
+    @property
+    def primary_failure(self) -> RequestWindowFailure | None:
+        if not self.failure_entries:
+            return None
+        return self.failure_entries[0]
+
+    @property
     def label(self) -> str:
         if self.is_range:
             start = self.resolved_start_date.isoformat() if self.resolved_start_date is not None else "n/a"
@@ -228,6 +308,7 @@ class RequestWindow:
         return base
 
     def to_mapping(self) -> dict[str, Any]:
+        primary_failure = self.primary_failure
         return {
             "kind": self.kind,
             "requested_date": self.requested_date.isoformat() if self.requested_date is not None else None,
@@ -235,9 +316,10 @@ class RequestWindow:
             "end_date": self.end_date.isoformat() if self.end_date is not None else None,
             "status": self.status,
             "completed_dates": [value.isoformat() for value in self.completed_dates],
-            "failed_date": self.failed_date.isoformat() if self.failed_date is not None else None,
-            "failed_source": self.failed_source,
-            "failure_reason": self.failure_reason,
+            "failures": [item.to_mapping() for item in self.failure_entries],
+            "failed_date": primary_failure.date.isoformat() if primary_failure is not None and primary_failure.date is not None else None,
+            "failed_source": primary_failure.source if primary_failure is not None else "",
+            "failure_reason": primary_failure.reason if primary_failure is not None else "",
         }
 
     @classmethod
@@ -245,6 +327,11 @@ class RequestWindow:
         completed_dates_value = payload.get("completed_dates", ())
         if not isinstance(completed_dates_value, (list, tuple)):
             completed_dates_value = ()
+        failures = _parse_request_window_failures(payload.get("failures"))
+        primary_failure = failures[0] if failures else None
+        failed_date = _parse_date(payload.get("failed_date")) or (primary_failure.date if primary_failure is not None else None)
+        failed_source = str(payload.get("failed_source", "")) or (primary_failure.source if primary_failure is not None else "")
+        failure_reason = str(payload.get("failure_reason", "")) or (primary_failure.reason if primary_failure is not None else "")
         return cls(
             kind=str(payload.get("kind", "day")),
             requested_date=_parse_date(payload.get("requested_date")),
@@ -257,9 +344,10 @@ class RequestWindow:
                 for parsed in (_parse_date(value),)
                 if parsed is not None
             ),
-            failed_date=_parse_date(payload.get("failed_date")),
-            failed_source=str(payload.get("failed_source", "")),
-            failure_reason=str(payload.get("failure_reason", "")),
+            failures=failures,
+            failed_date=failed_date,
+            failed_source=failed_source,
+            failure_reason=failure_reason,
         )
 
 
@@ -270,12 +358,9 @@ def _request_window_label_with_details(base: str, request_window: RequestWindow)
             "completed "
             + ", ".join(value.isoformat() for value in request_window.completed_dates)
         )
-    if request_window.failed_date is not None:
-        failed_bits = [f"failed {request_window.failed_date.isoformat()}"]
-        if request_window.failed_source:
-            failed_bits.append(request_window.failed_source)
-        details.append(" / ".join(failed_bits))
-    if request_window.failure_reason:
+    if request_window.failure_entries:
+        details.extend(item.label for item in request_window.failure_entries)
+    elif request_window.failure_reason:
         details.append(request_window.failure_reason)
     if details:
         return f"{base} ({request_window.status}; " + "; ".join(details) + ")"
@@ -344,11 +429,12 @@ class SourceRunStats:
 
     @property
     def resolved_live_outcome(self) -> str:
+        normalized_cache_status = _normalize_source_cache_status(self.cache_status)
         if self.live_outcome:
             return self.live_outcome
         if self.outcome in {"live-success", "live-zero", "live-failed", "unknown-legacy"}:
             return self.outcome
-        if self.cache_status == "fresh":
+        if normalized_cache_status == "fresh":
             if self.fetched_count > 0 or self.displayed_count > 0:
                 return "live-success"
             if self.error:
@@ -358,11 +444,12 @@ class SourceRunStats:
 
     @property
     def resolved_outcome(self) -> str:
+        normalized_cache_status = _normalize_source_cache_status(self.cache_status)
         if self.outcome:
             return self.outcome
-        if self.cache_status == "same-day-cache":
+        if normalized_cache_status == "same-day-cache":
             return "unknown-legacy" if self.resolved_live_outcome == "unknown-legacy" else "same-day-cache"
-        if self.cache_status == "stale-compatible-cache":
+        if normalized_cache_status == "stale-compatible-cache":
             return "unknown-legacy" if self.resolved_live_outcome == "unknown-legacy" else "stale-cache"
         return self.resolved_live_outcome
 
@@ -393,7 +480,7 @@ class SourceRunStats:
             status=str(payload.get("status", "ready")),
             outcome=str(payload.get("outcome", "")),
             live_outcome=str(payload.get("live_outcome", "")),
-            cache_status=str(payload.get("cache_status", "fresh")),
+            cache_status=_normalize_source_cache_status(payload.get("cache_status")),
             error=str(payload.get("error", "")),
             endpoint=str(payload.get("endpoint", "")),
             note=str(payload.get("note", "")),
@@ -532,8 +619,6 @@ class UserInterestProfile:
     def basis_summary_label(self) -> str:
         if self.profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
             return "baseline + live Zotero DB"
-        if self.profile_source == PROFILE_SOURCE_ZOTERO:
-            return "baseline + Zotero"
         if self.profile_source == PROFILE_SOURCE_ZOTERO_EXPORT:
             return "baseline + Zotero export"
         return "baseline only"
@@ -935,6 +1020,11 @@ class DailyFrontierReport:
     enhanced_track: str = ""
     enhanced_item_count: int = 0
     runtime_note: str = ""
+    llm_requested: bool = False
+    llm_applied: bool = False
+    llm_provider: str | None = None
+    llm_fallback_reason: str | None = None
+    llm_seconds: float | None = None
     report_status: str = "ready"
     report_error: str = ""
     fetch_scope: str = FETCH_SCOPE_DAY_FULL
@@ -945,6 +1035,8 @@ class DailyFrontierReport:
     repeated_themes: tuple[FrontierReportSignal, ...] = ()
     salient_topics: tuple[FrontierReportSignal, ...] = ()
     adjacent_themes: tuple[FrontierReportSignal, ...] = ()
+    deterministic_takeaways: tuple[str, ...] = ()
+    deterministic_field_highlights: tuple[FrontierReportHighlight, ...] = ()
     takeaways: tuple[str, ...] = ()
     field_highlights: tuple[FrontierReportHighlight, ...] = ()
     profile_relevant_highlights: tuple[FrontierReportHighlight, ...] = ()
@@ -978,6 +1070,11 @@ class DailyFrontierReport:
             "enhanced_track": self.enhanced_track,
             "enhanced_item_count": self.enhanced_item_count,
             "runtime_note": self.runtime_note,
+            "llm_requested": self.llm_requested,
+            "llm_applied": self.llm_applied,
+            "llm_provider": self.llm_provider,
+            "llm_fallback_reason": self.llm_fallback_reason,
+            "llm_seconds": self.llm_seconds,
             "report_status": self.report_status,
             "report_error": self.report_error,
             "fetch_scope": normalize_fetch_scope(self.fetch_scope),
@@ -988,6 +1085,10 @@ class DailyFrontierReport:
             "repeated_themes": [signal.to_mapping() for signal in self.repeated_themes],
             "salient_topics": [signal.to_mapping() for signal in self.salient_topics],
             "adjacent_themes": [signal.to_mapping() for signal in self.adjacent_themes],
+            "deterministic_takeaways": list(self.deterministic_takeaways),
+            "deterministic_field_highlights": [
+                item.to_mapping() for item in self.deterministic_field_highlights
+            ],
             "takeaways": list(self.takeaways),
             "field_highlights": [item.to_mapping() for item in self.field_highlights],
             "profile_relevant_highlights": [item.to_mapping() for item in self.profile_relevant_highlights],
@@ -1009,6 +1110,9 @@ class DailyFrontierReport:
         adjacent_themes_payload = payload.get("adjacent_themes", ())
         if not isinstance(adjacent_themes_payload, list):
             adjacent_themes_payload = []
+        deterministic_field_highlights_payload = payload.get("deterministic_field_highlights", ())
+        if not isinstance(deterministic_field_highlights_payload, list):
+            deterministic_field_highlights_payload = []
         field_highlights_payload = payload.get("field_highlights", ())
         if not isinstance(field_highlights_payload, list):
             field_highlights_payload = []
@@ -1029,6 +1133,16 @@ class DailyFrontierReport:
             RunTimings.from_mapping(run_timings_value)
             if isinstance(run_timings_value, Mapping)
             else RunTimings()
+        )
+        llm_provenance = backfill_llm_provenance(
+            requested_report_mode=str(payload.get("requested_report_mode", DEFAULT_REPORT_MODE)),
+            report_mode=str(payload.get("report_mode", DEFAULT_REPORT_MODE)),
+            cost_mode=str(payload.get("cost_mode", ZERO_TOKEN_COST_MODE)),
+            llm_requested=payload.get("llm_requested") if isinstance(payload.get("llm_requested"), bool) else None,
+            llm_applied=payload.get("llm_applied") if isinstance(payload.get("llm_applied"), bool) else None,
+            llm_provider=_parse_optional_text(payload.get("llm_provider")),
+            llm_fallback_reason=_parse_optional_text(payload.get("llm_fallback_reason")),
+            llm_seconds=_parse_float(payload.get("llm_seconds")),
         )
 
         return cls(
@@ -1051,11 +1165,16 @@ class DailyFrontierReport:
             enhanced_track=str(payload.get("enhanced_track", "")),
             enhanced_item_count=_parse_int(payload.get("enhanced_item_count")) or 0,
             runtime_note=str(payload.get("runtime_note", "")),
+            llm_requested=bool(llm_provenance["llm_requested"]),
+            llm_applied=bool(llm_provenance["llm_applied"]),
+            llm_provider=llm_provenance["llm_provider"],
+            llm_fallback_reason=llm_provenance["llm_fallback_reason"],
+            llm_seconds=_parse_float(llm_provenance["llm_seconds"]),
             report_status=str(payload.get("report_status", "ready")),
             report_error=str(payload.get("report_error", "")),
             fetch_scope=normalize_fetch_scope(
                 payload.get("fetch_scope"),
-                default=FETCH_SCOPE_SHORTLIST,
+                default=FETCH_SCOPE_DAY_FULL,
             ),
             searched_categories=tuple(str(value) for value in payload.get("searched_categories", ())),
             total_fetched=int(payload.get("total_fetched", 0)),
@@ -1079,6 +1198,14 @@ class DailyFrontierReport:
             adjacent_themes=tuple(
                 FrontierReportSignal.from_mapping(item)
                 for item in adjacent_themes_payload
+                if isinstance(item, Mapping)
+            ),
+            deterministic_takeaways=tuple(
+                str(value) for value in payload.get("deterministic_takeaways", ())
+            ),
+            deterministic_field_highlights=tuple(
+                FrontierReportHighlight.from_mapping(item)
+                for item in deterministic_field_highlights_payload
                 if isinstance(item, Mapping)
             ),
             takeaways=tuple(str(value) for value in payload.get("takeaways", ())),
@@ -1125,6 +1252,11 @@ class DailyDigest:
     enhanced_track: str = ""
     enhanced_item_count: int = 0
     runtime_note: str = ""
+    llm_requested: bool = False
+    llm_applied: bool = False
+    llm_provider: str | None = None
+    llm_fallback_reason: str | None = None
+    llm_seconds: float | None = None
     report_status: str = "ready"
     report_error: str = ""
     fetch_scope: str = FETCH_SCOPE_DAY_FULL
@@ -1256,6 +1388,11 @@ class DailyDigest:
             "enhanced_track": self.enhanced_track,
             "enhanced_item_count": self.enhanced_item_count,
             "runtime_note": self.runtime_note,
+            "llm_requested": self.llm_requested,
+            "llm_applied": self.llm_applied,
+            "llm_provider": self.llm_provider,
+            "llm_fallback_reason": self.llm_fallback_reason,
+            "llm_seconds": self.llm_seconds,
             "report_status": self.report_status,
             "report_error": self.report_error,
             "fetch_scope": normalize_fetch_scope(self.fetch_scope),
@@ -1316,6 +1453,16 @@ class DailyDigest:
             RunTimings.from_mapping(run_timings_value)
             if isinstance(run_timings_value, Mapping)
             else RunTimings()
+        )
+        llm_provenance = backfill_llm_provenance(
+            requested_report_mode=str(payload.get("requested_report_mode", DEFAULT_REPORT_MODE)),
+            report_mode=str(payload.get("report_mode", DEFAULT_REPORT_MODE)),
+            cost_mode=str(payload.get("cost_mode", ZERO_TOKEN_COST_MODE)),
+            llm_requested=payload.get("llm_requested") if isinstance(payload.get("llm_requested"), bool) else None,
+            llm_applied=payload.get("llm_applied") if isinstance(payload.get("llm_applied"), bool) else None,
+            llm_provider=_parse_optional_text(payload.get("llm_provider")),
+            llm_fallback_reason=_parse_optional_text(payload.get("llm_fallback_reason")),
+            llm_seconds=_parse_float(payload.get("llm_seconds")),
         )
 
         exploration_payload = payload.get("exploration_picks", ())
@@ -1452,11 +1599,16 @@ class DailyDigest:
             enhanced_track=str(payload.get("enhanced_track", "")),
             enhanced_item_count=_parse_int(payload.get("enhanced_item_count")) or 0,
             runtime_note=str(payload.get("runtime_note", "")),
+            llm_requested=bool(llm_provenance["llm_requested"]),
+            llm_applied=bool(llm_provenance["llm_applied"]),
+            llm_provider=llm_provenance["llm_provider"],
+            llm_fallback_reason=llm_provenance["llm_fallback_reason"],
+            llm_seconds=_parse_float(llm_provenance["llm_seconds"]),
             report_status=str(payload.get("report_status", "ready")),
             report_error=str(payload.get("report_error", "")),
             fetch_scope=normalize_fetch_scope(
                 payload.get("fetch_scope"),
-                default=FETCH_SCOPE_SHORTLIST,
+                default=FETCH_SCOPE_DAY_FULL,
             ),
             mode_notes=str(payload.get("mode_notes", "")),
             search_profile_label=str(payload.get("search_profile_label", "")),
@@ -1491,6 +1643,11 @@ class RunHistoryEntry:
     report_mode: str = DEFAULT_REPORT_MODE
     cost_mode: str = ZERO_TOKEN_COST_MODE
     enhanced_track: str = ""
+    llm_requested: bool = False
+    llm_applied: bool = False
+    llm_provider: str | None = None
+    llm_fallback_reason: str | None = None
+    llm_seconds: float | None = None
     fetch_scope: str = FETCH_SCOPE_DAY_FULL
     report_status: str = "ready"
     run_timings: RunTimings = field(default_factory=RunTimings)
@@ -1510,6 +1667,8 @@ class RunHistoryEntry:
     cache_path: str | None = None
     report_path: str | None = None
     eml_path: str | None = None
+    compatibility_status: str = ""
+    compatibility_reasons: tuple[str, ...] = ()
 
     @property
     def zotero_augmented(self) -> bool:
@@ -1529,6 +1688,18 @@ class RunHistoryEntry:
         if not self.profile_path:
             return ""
         return Path(self.profile_path).name
+
+    @property
+    def is_compatibility_entry(self) -> bool:
+        return bool(self.compatibility_status or self.compatibility_reasons)
+
+    @property
+    def compatibility_label(self) -> str:
+        if not self.is_compatibility_entry:
+            return ""
+        if self.compatibility_status == "archived":
+            return "compatibility / archived"
+        return "compatibility-only"
 
     def profile_summary_bits(self, term_limit: int = 3) -> tuple[str, ...]:
         bits: list[str] = []
@@ -1556,6 +1727,36 @@ def _parse_date(value: Any) -> date | None:
     return None
 
 
+def _build_request_window_failure(
+    *,
+    failed_date: date | None = None,
+    failed_source: str = "",
+    failure_reason: str = "",
+) -> RequestWindowFailure | None:
+    normalized_source = str(failed_source or "").strip().lower()
+    normalized_reason = " ".join(str(failure_reason or "").split())
+    if failed_date is None and not normalized_source and not normalized_reason:
+        return None
+    return RequestWindowFailure(
+        date=failed_date,
+        source=normalized_source,
+        reason=normalized_reason,
+    )
+
+
+def _parse_request_window_failures(value: Any) -> tuple[RequestWindowFailure, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    parsed_failures = tuple(
+        RequestWindowFailure.from_mapping(item)
+        for item in value
+        if isinstance(item, Mapping)
+    )
+    if parsed_failures:
+        return parsed_failures
+    return ()
+
+
 def _parse_datetime(value: Any) -> datetime | None:
     if isinstance(value, datetime):
         return value
@@ -1581,6 +1782,27 @@ def _parse_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_optional_text(value: Any) -> str | None:
+    normalized = " ".join(str(value or "").split()).strip()
+    if not normalized or normalized.lower() in {"none", "n/a"}:
+        return None
+    return normalized
+
+
+def _normalize_source_cache_status(value: Any) -> str:
+    normalized = str(value or "fresh").strip().lower()
+    aliases = {
+        "same-day cache": "same-day-cache",
+        "same-date-cache": "same-day-cache",
+        "same-date cache": "same-day-cache",
+        "stale-cache": "stale-compatible-cache",
+        "stale compatible cache": "stale-compatible-cache",
+        "stale-compatible-cache": "stale-compatible-cache",
+        "unknown-legacy": "unknown",
+    }
+    return aliases.get(normalized, normalized or "fresh")
 
 
 def _sum_known_seconds(*values: float | None) -> float | None:
@@ -1632,6 +1854,7 @@ def _legacy_profile_basis(
     zotero_item_count: int,
     zotero_used_item_count: int,
 ) -> ProfileBasis:
+    normalized_basis_label = basis_label.strip().lower()
     if zotero_db_name:
         return ProfileBasis(
             source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
@@ -1645,6 +1868,20 @@ def _legacy_profile_basis(
             source=PROFILE_SOURCE_ZOTERO_EXPORT,
             label=basis_label or "zotero export",
             path=zotero_export_name,
+            item_count=zotero_item_count,
+            used_item_count=zotero_used_item_count,
+        )
+    if "live zotero" in normalized_basis_label:
+        return ProfileBasis(
+            source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
+            label=basis_label or "live zotero db",
+            item_count=zotero_item_count,
+            used_item_count=zotero_used_item_count,
+        )
+    if "zotero" in normalized_basis_label:
+        return ProfileBasis(
+            source=PROFILE_SOURCE_ZOTERO_EXPORT,
+            label=basis_label or "zotero export",
             item_count=zotero_item_count,
             used_item_count=zotero_used_item_count,
         )

@@ -11,11 +11,11 @@ from typing import Any, Iterable, Mapping
 from frontier_compass.common.text_normalization import tokenize
 from frontier_compass.storage.schema import (
     PROFILE_SOURCE_LIVE_ZOTERO_DB,
-    PROFILE_SOURCE_ZOTERO,
     PROFILE_SOURCE_ZOTERO_EXPORT,
     ProfileBasis,
     UserInterestProfile,
     ZoteroRetrievalHint,
+    normalize_profile_source,
 )
 from frontier_compass.zotero.export_loader import ZoteroExportItem, load_csl_json_export
 from frontier_compass.zotero.sqlite_loader import load_sqlite_library
@@ -270,13 +270,14 @@ class ZoteroProfileBuilder:
         baseline: UserInterestProfile,
         *,
         items: Iterable[Mapping[str, Any] | ZoteroExportItem],
-        profile_source: str = PROFILE_SOURCE_ZOTERO,
-        profile_label: str = "Zotero",
+        profile_source: str = PROFILE_SOURCE_ZOTERO_EXPORT,
+        profile_label: str = "Zotero Export",
         profile_path: str = "",
         export_name: str = "",
         db_name: str = "",
         selected_collections: Iterable[str] = (),
     ) -> UserInterestProfile:
+        normalized_profile_source = normalize_profile_source(profile_source) or PROFILE_SOURCE_ZOTERO_EXPORT
         signals = self.derive_signals(items)
         collection_tuple = _dedupe_preserving_order(selected_collections)
         top_signal_text = ", ".join((*signals.keywords[:3], *signals.concepts[:2])) or "none"
@@ -286,18 +287,14 @@ class ZoteroProfileBuilder:
             if collection_tuple
             else ""
         )
-        if profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+        if normalized_profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
             source_summary = f"live local Zotero DB {db_name}"
             basis_label = "biomedical baseline + live Zotero DB"
             description = "Read-only local Zotero SQLite profile source."
-        elif profile_source == PROFILE_SOURCE_ZOTERO_EXPORT:
+        else:
             source_summary = f"CSL JSON Zotero export {export_name or profile_label}"
             basis_label = "biomedical baseline + Zotero export"
             description = "Read-only CSL JSON Zotero profile source."
-        else:
-            source_summary = f"Zotero export snapshot {export_name or profile_label}"
-            basis_label = "biomedical baseline + Zotero"
-            description = "Locally exported Zotero profile snapshot."
         notes = (
             f"{baseline.notes} Personalized with {source_summary}: "
             f"{signals.used_item_count} biomedical items from {signals.parsed_item_count} parsed; "
@@ -315,7 +312,7 @@ class ZoteroProfileBuilder:
                 notes=notes,
                 basis_label="biomedical baseline",
                 profile_basis=ProfileBasis(
-                    source=profile_source,
+                    source=normalized_profile_source,
                     label=profile_label,
                     description=description,
                     path=profile_path,
@@ -335,7 +332,7 @@ class ZoteroProfileBuilder:
             notes=notes,
             basis_label=basis_label,
             profile_basis=ProfileBasis(
-                source=profile_source,
+                source=normalized_profile_source,
                 label=profile_label,
                 description=description,
                 path=profile_path,

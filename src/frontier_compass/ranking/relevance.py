@@ -394,6 +394,66 @@ def explanation_summary_line(explanation: RecommendationExplanation) -> str:
     return " | ".join(parts)
 
 
+def why_this_paper_line(explanation: RecommendationExplanation) -> str:
+    parts: list[str] = []
+    if explanation.baseline_keyword_hits:
+        parts.append(f"matched biomedical signals: {', '.join(explanation.baseline_keyword_hits[:2])}")
+    if explanation.category_hits:
+        parts.append(f"held category support: {', '.join(explanation.category_hits[:2])}")
+    if explanation.retrieval_support_origin == "zotero":
+        if explanation.retrieval_support_terms:
+            parts.append(f"surfaced via Zotero retrieval hint: {', '.join(explanation.retrieval_support_terms[:2])}")
+        else:
+            parts.append("surfaced via a Zotero retrieval hint")
+    if not parts and explanation.zotero_effect in {"mild", "strong"}:
+        zotero_hits = _merge_signal_hits(explanation.zotero_concept_hits, explanation.zotero_keyword_hits)
+        if zotero_hits:
+            parts.append(f"picked up secondary Zotero support: {', '.join(zotero_hits[:2])}")
+        else:
+            parts.append("picked up secondary Zotero support")
+    if not parts and explanation.generic_cs_penalty_contribution > 0.0:
+        return "Stayed visible mainly on recency despite a generic-CS penalty."
+    if not parts:
+        return "Selected by the current deterministic ranking pipeline."
+    return "; ".join(parts[:3])
+
+
+def score_explanation_line(explanation: RecommendationExplanation) -> str:
+    positive_parts = [
+        f"{label.lower()} {value:+.3f}"
+        for label, value in explanation_breakdown_rows(explanation)
+        if value > 0.0
+    ]
+    if positive_parts:
+        line = "Score leans on " + _join_text_parts(positive_parts[:3]) + "."
+    else:
+        line = "Score stays modest because the current ranking signals are light."
+    if explanation.generic_cs_penalty_contribution > 0.0:
+        line = (
+            line[:-1]
+            + f"; generic-CS penalty {-explanation.generic_cs_penalty_contribution:+.3f}."
+        )
+    return line
+
+
+def interest_relevance_line(explanation: RecommendationExplanation) -> str:
+    parts: list[str] = []
+    if explanation.baseline_keyword_hits:
+        parts.append(f"keyword overlap: {', '.join(explanation.baseline_keyword_hits[:3])}")
+    if explanation.category_hits:
+        parts.append(f"category fit: {', '.join(explanation.category_hits[:3])}")
+    zotero_hits = _merge_signal_hits(explanation.zotero_concept_hits, explanation.zotero_keyword_hits)
+    if zotero_hits:
+        parts.append(f"Zotero overlap: {', '.join(zotero_hits[:3])}")
+    elif explanation.retrieval_support_origin == "zotero" and explanation.retrieval_support_terms:
+        parts.append(f"Zotero retrieval hint: {', '.join(explanation.retrieval_support_terms[:3])}")
+    if parts:
+        return "; ".join(parts[:3])
+    if explanation.generic_cs_penalty_contribution > 0.0:
+        return "Interest overlap is light; this stays visible more on timing than on strong biomedical fit."
+    return "Interest overlap is broad rather than keyword-specific in the current profile."
+
+
 def explanation_breakdown_rows(explanation: RecommendationExplanation) -> tuple[tuple[str, float], ...]:
     return (
         ("Biomedical baseline", explanation.baseline_contribution),
@@ -428,6 +488,17 @@ def explanation_detail_lines(explanation: RecommendationExplanation) -> tuple[st
     if explanation.generic_cs_penalty_contribution > 0.0:
         lines.append("Generic-CS penalty applied because no strong biomedical evidence was found.")
     return tuple(lines)
+
+
+def _join_text_parts(parts: Iterable[str]) -> str:
+    values = [part for part in parts if part]
+    if not values:
+        return ""
+    if len(values) == 1:
+        return values[0]
+    if len(values) == 2:
+        return f"{values[0]} and {values[1]}"
+    return ", ".join(values[:-1]) + f", and {values[-1]}"
 
 
 def recommendation_explanation_for_ranked_paper(

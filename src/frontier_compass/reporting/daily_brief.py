@@ -239,25 +239,25 @@ def _build_takeaways(
     shown_count = len(ranked_papers)
     if shown_count == 0:
         return (
-            f"Showing 0 of {total_ranked} ranked papers in the current view.",
-            "Lower the minimum score or switch to show all ranked papers to inspect the full digest.",
+            f"Digest shortlist shows 0 of {total_ranked} ranked papers for this run.",
+            "Lower the minimum score or switch to show all ranked papers to inspect the full digest outside the shortlist.",
         )
 
     takeaways = [
         (
-            f"Showing {shown_count} of {total_ranked} ranked papers in the current view; "
+            f"Digest shortlist shows {shown_count} of {total_ranked} ranked papers for this run; "
             f"{recommended_count} clear the recommendation threshold ({recommended_threshold:.2f}+)."
         ),
         (
-            f"Visible themes in this view: {_signal_text(top_theme_signals)}."
+            f"Repeated themes in the shortlist: {_signal_text(top_theme_signals)}."
             if top_theme_signals
-            else "Visible themes are diffuse with no repeated pattern in the current view."
+            else "Shortlist themes are diffuse with no repeated pattern in the current reading-first lane."
         ),
         (
-            f"Matched biomedical signals in this view: {_signal_text(top_keyword_signals)}."
+            f"User-interest signals in the shortlist: {_signal_text(top_keyword_signals)}."
             if top_keyword_signals
             else (
-                "Matched biomedical keyword hits are sparse in this view; the shortlist is leaning more on "
+                "Matched biomedical keyword hits are sparse in the shortlist; the read-first lane is leaning more on "
                 "category fit, recency, and score."
             )
         ),

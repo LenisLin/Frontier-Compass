@@ -16,11 +16,15 @@ SUPPORTED_USER_DEFAULT_KEYS = frozenset(
         "default_mode",
         "default_report_mode",
         "default_max_results",
+        "default_zotero_db_path",
         "default_zotero_export_path",
         "default_email_to",
         "default_email_from",
         "default_generate_dry_run_email",
         "default_allow_stale_cache",
+        "default_llm_base_url",
+        "default_llm_api_key",
+        "default_llm_model",
     }
 )
 SETTING_SOURCE_BUILT_IN = "built-in"
@@ -33,11 +37,15 @@ class UserDefaults:
     default_mode: str | None = None
     default_report_mode: str | None = None
     default_max_results: int | None = None
+    default_zotero_db_path: Path | None = None
     default_zotero_export_path: Path | None = None
     default_email_to: tuple[str, ...] = ()
     default_email_from: str | None = None
     default_generate_dry_run_email: bool | None = None
     default_allow_stale_cache: bool | None = None
+    default_llm_base_url: str | None = None
+    default_llm_api_key: str | None = None
+    default_llm_model: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -88,6 +96,11 @@ def load_user_defaults(
         default_mode=_parse_optional_text(payload, "default_mode"),
         default_report_mode=_parse_optional_report_mode(payload, "default_report_mode"),
         default_max_results=_parse_optional_positive_int(payload, "default_max_results"),
+        default_zotero_db_path=_parse_optional_path(
+            payload,
+            "default_zotero_db_path",
+            config_dir=resolved_path.parent,
+        ),
         default_zotero_export_path=_parse_optional_path(
             payload,
             "default_zotero_export_path",
@@ -97,6 +110,9 @@ def load_user_defaults(
         default_email_from=_parse_optional_text(payload, "default_email_from"),
         default_generate_dry_run_email=_parse_optional_bool(payload, "default_generate_dry_run_email"),
         default_allow_stale_cache=_parse_optional_bool(payload, "default_allow_stale_cache"),
+        default_llm_base_url=_parse_optional_text(payload, "default_llm_base_url"),
+        default_llm_api_key=_parse_optional_text(payload, "default_llm_api_key"),
+        default_llm_model=_parse_optional_text(payload, "default_llm_model"),
     )
     return LoadedUserDefaults(path=resolved_path, defaults=defaults, loaded=True)
 

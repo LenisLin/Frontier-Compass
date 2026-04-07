@@ -9,10 +9,22 @@ from datetime import date, datetime, timezone
 from html import unescape
 from pathlib import Path
 
-from frontier_compass.common.report_mode import DEFAULT_REPORT_MODE, ZERO_TOKEN_COST_MODE
+from frontier_compass.common.source_bundles import (
+    DEFAULT_SOURCE_BUNDLES_PATH,
+    resolve_source_bundle,
+)
+from frontier_compass.common.report_mode import (
+    DEFAULT_REPORT_MODE,
+    ZERO_TOKEN_COST_MODE,
+    backfill_llm_provenance,
+    format_llm_bool,
+    format_llm_provider,
+    format_llm_seconds,
+)
 from frontier_compass.reporting.html_report import extract_report_summary_value
 from frontier_compass.storage.schema import (
     DailyDigest,
+    FETCH_SCOPE_DAY_FULL,
     RequestWindow,
     RunHistoryEntry,
     RunTimings,
@@ -36,7 +48,7 @@ _RUN_SUMMARY_PATTERN = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _ARTIFACT_DATE_PATTERN = re.compile(
-    r"_(\d{4}-\d{2}-\d{2})(?:_to_\d{4}-\d{2}-\d{2})?(?:_(?:zotero|profile-live-zotero-db)-[^.]*)?$"
+    r"_(\d{4}-\d{2}-\d{2})(?:_to_\d{4}-\d{2}-\d{2})?(?:_(?:zotero|profile-zotero-export|profile-live-zotero-db)-[^.]*)?$"
 )
 _FRESH_FETCH_STATUS_PATTERN = re.compile(r"^fresh\s+.+\s+fetch$", flags=re.IGNORECASE)
 _FETCH_STATUS_ALIASES = {
@@ -61,6 +73,11 @@ class ReportHistoryMetadata:
     report_mode: str = DEFAULT_REPORT_MODE
     cost_mode: str = ZERO_TOKEN_COST_MODE
     enhanced_track: str = ""
+    llm_requested: bool = False
+    llm_applied: bool = False
+    llm_provider: str | None = None
+    llm_fallback_reason: str | None = None
+    llm_seconds: float | None = None
     profile_basis: str = ""
     profile_source: str = ""
     profile_path: str = ""
@@ -133,6 +150,25 @@ def read_report_history_metadata(report_path: str | Path) -> ReportHistoryMetada
     mode_label, category = _parse_mode_value(extract_report_summary_value(report_html, "Mode"))
     requested_date = _parse_iso_date(extract_report_summary_value(report_html, "Requested date")) or _parse_artifact_date(path)
     effective_date = _parse_iso_date(extract_report_summary_value(report_html, "Effective release date")) or requested_date
+    profile_source = _parse_profile_source_value(extract_report_summary_value(report_html, "Profile source"))
+    profile_path = extract_report_summary_value(report_html, "Profile path")
+    profile_item_count, profile_used_item_count = _parse_profile_item_counts(
+        extract_report_summary_value(report_html, "Profile items parsed / used")
+    )
+    llm_provenance = backfill_llm_provenance(
+        requested_report_mode=(
+            extract_report_summary_value(report_html, "Requested report mode") or DEFAULT_REPORT_MODE
+        ),
+        report_mode=extract_report_summary_value(report_html, "Frontier Report mode") or DEFAULT_REPORT_MODE,
+        cost_mode=extract_report_summary_value(report_html, "Cost mode") or ZERO_TOKEN_COST_MODE,
+        llm_requested=_parse_optional_bool(extract_report_summary_value(report_html, "LLM requested")),
+        llm_applied=_parse_optional_bool(extract_report_summary_value(report_html, "LLM applied")),
+        llm_provider=_normalize_optional_text(extract_report_summary_value(report_html, "LLM provider")),
+        llm_fallback_reason=_normalize_optional_text(
+            extract_report_summary_value(report_html, "LLM fallback reason")
+        ),
+        llm_seconds=_parse_duration_seconds(extract_report_summary_value(report_html, "LLM time")),
+    )
     return ReportHistoryMetadata(
         fetch_status=_normalize_fetch_status(extract_report_summary_value(report_html, "Fetch status")),
         requested_date=requested_date,
@@ -147,9 +183,18 @@ def read_report_history_metadata(report_path: str | Path) -> ReportHistoryMetada
         report_mode=extract_report_summary_value(report_html, "Frontier Report mode") or DEFAULT_REPORT_MODE,
         cost_mode=extract_report_summary_value(report_html, "Cost mode") or ZERO_TOKEN_COST_MODE,
         enhanced_track=extract_report_summary_value(report_html, "Enhanced track"),
+        llm_requested=bool(llm_provenance["llm_requested"]),
+        llm_applied=bool(llm_provenance["llm_applied"]),
+        llm_provider=llm_provenance["llm_provider"],
+        llm_fallback_reason=llm_provenance["llm_fallback_reason"],
+        llm_seconds=_parse_float(llm_provenance["llm_seconds"]),
         profile_basis=extract_report_summary_value(report_html, "Profile basis"),
-        profile_source="",
-        fetch_scope=extract_report_summary_value(report_html, "Fetch scope") or "shortlist",
+        profile_source=profile_source,
+        profile_path=profile_path,
+        profile_item_count=profile_item_count,
+        profile_used_item_count=profile_used_item_count,
+        profile_terms=_parse_profile_terms(extract_report_summary_value(report_html, "Top profile terms")),
+        fetch_scope=extract_report_summary_value(report_html, "Fetch scope") or FETCH_SCOPE_DAY_FULL,
         report_status=extract_report_summary_value(report_html, "Report status") or "ready",
         report_error=extract_report_summary_value(report_html, "Fresh fetch error"),
         ranked_count=(
@@ -197,6 +242,7 @@ def list_recent_daily_runs(
         ),
         reverse=True,
     )
+    rows.sort(key=lambda item: 1 if item.is_compatibility_entry else 0)
     if limit is not None:
         return rows[: max(limit, 0)]
     return rows
@@ -215,28 +261,27 @@ def format_history_requested_effective_label(entry: RunHistoryEntry) -> str:
 def build_history_summary_bits(entry: RunHistoryEntry) -> tuple[str, ...]:
     summary_bits = [
         entry.fetch_status or "n/a",
-        f"ranked {entry.ranked_count}",
+        f"window {_history_request_window_text(entry)}",
+        f"scope {entry.fetch_scope or FETCH_SCOPE_DAY_FULL}",
+        f"profile source {entry.profile_source or 'n/a'}",
+        f"source composition {_history_source_composition_text(entry)}",
         f"report {entry.report_mode}/{entry.report_status}",
-        entry.cost_mode or ZERO_TOKEN_COST_MODE,
+        f"cache story {_history_cache_story_text(entry)}",
+        f"ranked {entry.ranked_count}",
     ]
-    profile_bits = entry.profile_summary_bits()
-    if profile_bits:
-        summary_bits.extend(profile_bits)
-    else:
-        summary_bits.append(entry.profile_label or "n/a")
-    if entry.fetch_scope and entry.fetch_scope != "day-full":
-        summary_bits.append(entry.fetch_scope)
-    if entry.source_run_stats:
-        summary_bits.append(
-            " | ".join(
-                _format_history_source_run_stat(row)
-                for row in entry.source_run_stats
-            )
-        )
-    elif entry.source_counts:
-        summary_bits.append(" | ".join(f"{source} {count}" for source, count in sorted(entry.source_counts.items())))
+    if entry.profile_label and entry.profile_label != (entry.profile_source or ""):
+        summary_bits.append(entry.profile_label)
+    summary_bits.append(entry.cost_mode or ZERO_TOKEN_COST_MODE)
     if entry.run_timings.total_seconds is not None:
         summary_bits.append(f"time {entry.run_timings.total_seconds:.2f}s")
+    if entry.profile_source and entry.profile_source != "baseline":
+        summary_bits.append(entry.profile_source)
+    if entry.profile_path_name:
+        summary_bits.append(f"profile {entry.profile_path_name}")
+    if entry.profile_item_count or entry.profile_used_item_count:
+        summary_bits.append(f"profile items {entry.profile_item_count}/{entry.profile_used_item_count}")
+    if entry.profile_terms:
+        summary_bits.append(f"profile terms {', '.join(entry.profile_terms[:3])}")
     if entry.frontier_report_present is False:
         summary_bits.append("frontier report unavailable")
     if entry.report_artifact_aligned is False:
@@ -249,7 +294,55 @@ def build_history_summary_bits(entry: RunHistoryEntry) -> tuple[str, ...]:
         summary_bits.append("zotero enabled")
     if entry.exploration_pick_count:
         summary_bits.append(f"exploration {entry.exploration_pick_count}")
+    if entry.is_compatibility_entry:
+        summary_bits.append(entry.compatibility_label)
     return tuple(summary_bits)
+
+
+def format_history_llm_provenance_text(entry: RunHistoryEntry) -> str:
+    return (
+        f"LLM requested {format_llm_bool(entry.llm_requested)} | "
+        f"applied {format_llm_bool(entry.llm_applied)} | "
+        f"provider {format_llm_provider(entry.llm_provider)} | "
+        f"fallback {entry.llm_fallback_reason or 'none'} | "
+        f"time {format_llm_seconds(entry.llm_seconds)}"
+    )
+
+
+def format_history_compatibility_text(entry: RunHistoryEntry) -> str:
+    if not entry.is_compatibility_entry:
+        return "current-contract artifact"
+    if entry.compatibility_reasons:
+        return f"{entry.compatibility_label}: {'; '.join(entry.compatibility_reasons)}"
+    return entry.compatibility_label
+
+
+def _history_source_composition_text(entry: RunHistoryEntry) -> str:
+    if entry.source_run_stats:
+        return ", ".join(
+            f"{row.source} {row.displayed_count}/{row.fetched_count}"
+            for row in entry.source_run_stats
+        )
+    if entry.source_counts:
+        return ", ".join(f"{source} {count}" for source, count in sorted(entry.source_counts.items()))
+    return "n/a"
+
+
+def _history_request_window_text(entry: RunHistoryEntry) -> str:
+    label = entry.request_window.label
+    if label and label != "n/a":
+        return label
+    return format_history_requested_effective_label(entry)
+
+
+def _history_cache_story_text(entry: RunHistoryEntry) -> str:
+    if entry.stale_cache_fallback_used:
+        return "older compatible cache reused after fetch failure"
+    if entry.same_date_cache_reused:
+        return "same-date cache reused after fetch failure"
+    if not entry.fetch_status or entry.fetch_status == FETCH_STATUS_UNAVAILABLE:
+        return "report missing"
+    return entry.fetch_status
 
 
 def _format_history_source_run_stat(row: SourceRunStats) -> str:
@@ -319,6 +412,13 @@ def _scan_cached_digest_rows(*, cache_root: Path, report_root: Path) -> list[Run
             if report_metadata is not None and report_metadata.fetch_status
             else _fallback_fetch_status(digest)
         )
+        compatibility_status, compatibility_reasons = _classify_history_entry(
+            cache_path=str(cache_path),
+            report_path=str(report_path) if report_path.exists() else None,
+            category=digest.category,
+            source_run_stats=source_run_stats,
+            frontier_report_present=frontier_report_present,
+        )
         rows.append(
             RunHistoryEntry(
                 requested_date=digest.requested_target_date,
@@ -358,6 +458,31 @@ def _scan_cached_digest_rows(*, cache_root: Path, report_root: Path) -> list[Run
                     if report_metadata is not None and report_metadata.enhanced_track
                     else digest.enhanced_track
                 ),
+                llm_requested=(
+                    report_metadata.llm_requested
+                    if report_metadata is not None
+                    else digest.llm_requested
+                ),
+                llm_applied=(
+                    report_metadata.llm_applied
+                    if report_metadata is not None
+                    else digest.llm_applied
+                ),
+                llm_provider=(
+                    report_metadata.llm_provider
+                    if report_metadata is not None and report_metadata.llm_provider is not None
+                    else digest.llm_provider
+                ),
+                llm_fallback_reason=(
+                    report_metadata.llm_fallback_reason
+                    if report_metadata is not None and report_metadata.llm_fallback_reason is not None
+                    else digest.llm_fallback_reason
+                ),
+                llm_seconds=(
+                    report_metadata.llm_seconds
+                    if report_metadata is not None and report_metadata.llm_seconds is not None
+                    else digest.llm_seconds
+                ),
                 fetch_scope=digest.fetch_scope,
                 report_status=(
                     report_metadata.report_status
@@ -393,6 +518,8 @@ def _scan_cached_digest_rows(*, cache_root: Path, report_root: Path) -> list[Run
                 report_path=str(report_path) if report_path.exists() else None,
                 eml_path=str(eml_path) if eml_path.exists() else None,
                 generated_at=digest.generated_at,
+                compatibility_status=compatibility_status,
+                compatibility_reasons=compatibility_reasons,
             )
         )
     return rows
@@ -427,6 +554,15 @@ def _scan_orphan_report_rows(
             if report_metadata.stale_cache_fallback_used
             else FETCH_STATUS_UNAVAILABLE
         )
+        report_path_value = str(report_path)
+        cache_path_value = str(cache_path) if cache_path.exists() else None
+        compatibility_status, compatibility_reasons = _classify_history_entry(
+            cache_path=cache_path_value,
+            report_path=report_path_value,
+            category=report_metadata.category,
+            source_run_stats=report_metadata.source_run_stats,
+            frontier_report_present=report_metadata.frontier_report_present,
+        )
         rows.append(
             RunHistoryEntry(
                 requested_date=report_metadata.requested_date,
@@ -448,6 +584,11 @@ def _scan_orphan_report_rows(
                 report_mode=report_metadata.report_mode,
                 cost_mode=report_metadata.cost_mode,
                 enhanced_track=report_metadata.enhanced_track,
+                llm_requested=report_metadata.llm_requested,
+                llm_applied=report_metadata.llm_applied,
+                llm_provider=report_metadata.llm_provider,
+                llm_fallback_reason=report_metadata.llm_fallback_reason,
+                llm_seconds=report_metadata.llm_seconds,
                 fetch_scope=report_metadata.fetch_scope,
                 report_status=report_metadata.report_status,
                 run_timings=report_metadata.run_timings,
@@ -461,10 +602,12 @@ def _scan_orphan_report_rows(
                 ),
                 ranked_count=report_metadata.ranked_count or 0,
                 exploration_pick_count=None,
-                cache_path=str(cache_path) if cache_path.exists() else None,
-                report_path=str(report_path),
+                cache_path=cache_path_value,
+                report_path=report_path_value,
                 eml_path=str(eml_path) if eml_path.exists() else None,
                 generated_at=report_metadata.generated_at,
+                compatibility_status=compatibility_status,
+                compatibility_reasons=compatibility_reasons,
             )
         )
     return rows
@@ -585,6 +728,16 @@ def _extract_run_summary_metadata(report_html: str) -> ReportHistoryMetadata | N
     )
     requested_date = _parse_iso_date(str(payload.get("requested_date", "")))
     effective_date = _parse_iso_date(str(payload.get("effective_date", ""))) or requested_date
+    llm_provenance = backfill_llm_provenance(
+        requested_report_mode=str(payload.get("requested_report_mode", DEFAULT_REPORT_MODE)),
+        report_mode=str(payload.get("report_mode", DEFAULT_REPORT_MODE)),
+        cost_mode=str(payload.get("cost_mode", ZERO_TOKEN_COST_MODE)),
+        llm_requested=payload.get("llm_requested") if isinstance(payload.get("llm_requested"), bool) else None,
+        llm_applied=payload.get("llm_applied") if isinstance(payload.get("llm_applied"), bool) else None,
+        llm_provider=_normalize_optional_text(str(payload.get("llm_provider", ""))),
+        llm_fallback_reason=_normalize_optional_text(str(payload.get("llm_fallback_reason", ""))),
+        llm_seconds=_parse_float(payload.get("llm_seconds")),
+    )
     return ReportHistoryMetadata(
         fetch_status=_normalize_fetch_status(str(payload.get("fetch_status", ""))),
         requested_date=requested_date,
@@ -604,6 +757,11 @@ def _extract_run_summary_metadata(report_html: str) -> ReportHistoryMetadata | N
         report_mode=str(payload.get("report_mode", DEFAULT_REPORT_MODE)),
         cost_mode=str(payload.get("cost_mode", ZERO_TOKEN_COST_MODE)),
         enhanced_track=str(payload.get("enhanced_track", "")),
+        llm_requested=bool(llm_provenance["llm_requested"]),
+        llm_applied=bool(llm_provenance["llm_applied"]),
+        llm_provider=llm_provenance["llm_provider"],
+        llm_fallback_reason=llm_provenance["llm_fallback_reason"],
+        llm_seconds=_parse_float(llm_provenance["llm_seconds"]),
         profile_basis=str(payload.get("profile_basis", "")),
         profile_source=normalize_profile_source(str(payload.get("profile_source", ""))) or "",
         profile_path=str(payload.get("profile_path", "")),
@@ -614,7 +772,7 @@ def _extract_run_summary_metadata(report_html: str) -> ReportHistoryMetadata | N
             for value in payload.get("profile_terms", ())
             if str(value).strip()
         ),
-        fetch_scope=str(payload.get("fetch_scope", "shortlist")),
+        fetch_scope=str(payload.get("fetch_scope", FETCH_SCOPE_DAY_FULL)),
         report_status=str(payload.get("report_status", "ready")),
         report_error=str(payload.get("report_error", "") or payload.get("fetch_error", "")),
         ranked_count=_parse_int(payload.get("ranked_count")),
@@ -641,6 +799,31 @@ def _parse_summary_int(value: str) -> int:
         return 0
 
 
+def _parse_profile_source_value(value: str) -> str:
+    normalized = value.split("(", 1)[0].strip()
+    return normalize_profile_source(normalized) or ""
+
+
+def _parse_profile_item_counts(value: str) -> tuple[int, int]:
+    match = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", value)
+    if match is None:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
+
+
+def _parse_profile_terms(value: str) -> tuple[str, ...]:
+    if not value:
+        return ()
+    return tuple(part.strip() for part in value.split(",") if part.strip())
+
+
+def _normalize_optional_text(value: str) -> str | None:
+    normalized = " ".join(str(value or "").split()).strip()
+    if not normalized or normalized.lower() in {"n/a", "none"}:
+        return None
+    return normalized
+
+
 def _parse_iso_date(value: str) -> date | None:
     if not value:
         return None
@@ -661,6 +844,13 @@ def _parse_int(value: object) -> int | None:
         return None
 
 
+def _parse_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_optional_bool(value: object) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -671,6 +861,92 @@ def _parse_optional_bool(value: object) -> bool | None:
         if normalized in {"false", "no", "0"}:
             return False
     return None
+
+
+def _parse_duration_seconds(value: str) -> float | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized or normalized in {"n/a", "none"}:
+        return None
+    if normalized.endswith("s"):
+        normalized = normalized[:-1]
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _path_in_history_compatibility_archive(path_value: str | None) -> bool:
+    if not path_value:
+        return False
+    return "live_validation" in Path(path_value).parts
+
+
+def _path_has_legacy_profile_name(path_value: str | None) -> bool:
+    if not path_value:
+        return False
+    return "_zotero-" in Path(path_value).name
+
+
+def _classify_history_entry(
+    *,
+    cache_path: str | None,
+    report_path: str | None,
+    category: str,
+    source_run_stats: tuple[SourceRunStats, ...],
+    frontier_report_present: bool | None,
+) -> tuple[str, tuple[str, ...]]:
+    reasons: list[str] = []
+    normalized_category = category.strip().lower()
+    unexpected_bundle_sources = _unexpected_official_bundle_sources(
+        category=category,
+        source_run_stats=source_run_stats,
+    )
+    if _path_in_history_compatibility_archive(cache_path) or _path_in_history_compatibility_archive(report_path):
+        reasons.append("archived live-validation artifact")
+    if normalized_category in {
+        BIOMEDICAL_LATEST_MODE,
+        BIOMEDICAL_DISCOVERY_MODE,
+        BIOMEDICAL_DAILY_MODE,
+    }:
+        reasons.append(f"legacy compatibility mode id: {normalized_category}")
+    if normalized_category == BIOMEDICAL_MULTISOURCE_MODE:
+        reasons.append("legacy 3-source compatibility path")
+    if unexpected_bundle_sources:
+        reasons.append(
+            "official bundle artifact contains unexpected source rows: "
+            + ", ".join(unexpected_bundle_sources)
+        )
+    if _path_has_legacy_profile_name(cache_path) or _path_has_legacy_profile_name(report_path):
+        reasons.append("legacy profile artifact name")
+    if any(
+        row.resolved_outcome == "unknown-legacy" or row.resolved_live_outcome == "unknown-legacy"
+        for row in source_run_stats
+    ):
+        reasons.append("legacy source provenance backfill")
+    if frontier_report_present is False:
+        reasons.append("legacy cache without frontier report")
+    if not reasons:
+        return "", ()
+    status = "archived" if any(reason.startswith("archived") for reason in reasons) else "legacy"
+    return status, tuple(reasons)
+
+
+def _unexpected_official_bundle_sources(
+    *,
+    category: str,
+    source_run_stats: tuple[SourceRunStats, ...],
+) -> tuple[str, ...]:
+    bundle = resolve_source_bundle(category, config_path=DEFAULT_SOURCE_BUNDLES_PATH)
+    if bundle is None or not bundle.official:
+        return ()
+    expected_sources = {source.strip().lower() for source in bundle.enabled_sources if source.strip()}
+    present_sources = {
+        str(row.source).strip().lower()
+        for row in source_run_stats
+        if str(row.source).strip()
+    }
+    unexpected_sources = sorted(source for source in present_sources if source not in expected_sources)
+    return tuple(unexpected_sources)
 
 
 def _has_known_timings(run_timings: RunTimings) -> bool:
@@ -696,6 +972,8 @@ def _parse_artifact_date(path: Path) -> date | None:
 
 def _default_mode_kind(category: str) -> str:
     normalized = category.strip().lower()
+    if resolve_source_bundle(normalized, config_path=DEFAULT_SOURCE_BUNDLES_PATH) is not None:
+        return "source-bundle"
     if normalized == BIOMEDICAL_LATEST_MODE:
         return "latest-available-hybrid"
     if normalized == BIOMEDICAL_MULTISOURCE_MODE:

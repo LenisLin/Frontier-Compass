@@ -11,6 +11,14 @@ from time import perf_counter
 from typing import Any, Mapping, Sequence
 
 from frontier_compass.common.frontier_report import build_daily_frontier_report
+from frontier_compass.common.frontier_report_llm import (
+    FrontierReportLLMConfigurationError,
+    FrontierReportLLMError,
+    FrontierReportLLMSettings,
+    build_model_assisted_frontier_report,
+    frontier_report_llm_unavailable_reason,
+    resolve_frontier_report_llm_settings,
+)
 from frontier_compass.common.report_mode import (
     DEFAULT_REPORT_MODE,
     build_report_runtime_contract,
@@ -54,7 +62,7 @@ from frontier_compass.ingest.arxiv import (
     merge_paper_batches,
 )
 from frontier_compass.ingest.biorxiv import BioRxivClient
-from frontier_compass.ingest.common import measure_operation
+from frontier_compass.ingest.common import FeedFetchDetails, measure_operation
 from frontier_compass.ingest.medrxiv import MedRxivClient
 from frontier_compass.ingest.source_snapshots import (
     DEFAULT_SOURCE_SNAPSHOT_DIR,
@@ -67,9 +75,11 @@ from frontier_compass.ranking.relevance import (
     RelevanceRanker,
     explanation_breakdown_rows,
     explanation_detail_lines,
-    explanation_summary_line,
+    interest_relevance_line,
     priority_label_for_score,
     recommendation_explanation_for_ranked_paper,
+    score_explanation_line,
+    why_this_paper_line,
     zotero_effect_badge_text,
 )
 from frontier_compass.reporting.daily_brief import theme_label_for_ranked_paper
@@ -82,18 +92,19 @@ from frontier_compass.storage.schema import (
     FETCH_SCOPE_SHORTLIST as SCHEMA_FETCH_SCOPE_SHORTLIST,
     PaperRecord,
     PROFILE_SOURCE_BASELINE as SCHEMA_PROFILE_SOURCE_BASELINE,
-    PROFILE_SOURCE_ZOTERO as SCHEMA_PROFILE_SOURCE_ZOTERO,
     PROFILE_SOURCE_LIVE_ZOTERO_DB as SCHEMA_PROFILE_SOURCE_LIVE_ZOTERO_DB,
     PROFILE_SOURCE_ZOTERO_EXPORT as SCHEMA_PROFILE_SOURCE_ZOTERO_EXPORT,
     ProfileBasis,
     RankedPaper,
     RequestWindow,
+    RequestWindowFailure,
     RunHistoryEntry,
     RunTimings,
     SourceRunStats,
     UserInterestProfile,
-    normalize_fetch_scope as normalize_schema_fetch_scope,
     normalize_profile_source,
+    normalize_fetch_scope as normalize_schema_fetch_scope,
+    resolve_requested_profile_source,
 )
 from frontier_compass.ui.history import list_recent_daily_runs, report_path_for_cache_artifact
 from frontier_compass.zotero.export_loader import load_csl_json_export
@@ -101,11 +112,13 @@ from frontier_compass.zotero.local_library import (
     DEFAULT_ZOTERO_EXPORT_PATH,
     DEFAULT_ZOTERO_STATUS_PATH,
     ZoteroLibraryState,
+    discover_local_zotero_db_details,
     ensure_local_zotero_export,
     filter_items_by_collections,
     read_local_zotero_state,
 )
 from frontier_compass.zotero.profile_builder import ZoteroProfileBuilder
+from frontier_compass.zotero.sqlite_loader import load_sqlite_library
 
 
 DEFAULT_DAILY_CACHE_DIR = Path("data/cache")
@@ -136,7 +149,6 @@ DISPLAY_SOURCE_REUSED_SAME_DATE_CACHE = "reused same-date cache after fetch fail
 DISPLAY_SOURCE_REUSED_STALE_CACHE = "older compatible cache reused after fetch failure"
 DISPLAY_SOURCE_RANGE_AGGREGATED = "aggregated from day artifacts"
 PROFILE_SOURCE_BASELINE = SCHEMA_PROFILE_SOURCE_BASELINE
-PROFILE_SOURCE_ZOTERO = SCHEMA_PROFILE_SOURCE_ZOTERO
 PROFILE_SOURCE_ZOTERO_EXPORT = SCHEMA_PROFILE_SOURCE_ZOTERO_EXPORT
 PROFILE_SOURCE_LIVE_ZOTERO_DB = SCHEMA_PROFILE_SOURCE_LIVE_ZOTERO_DB
 FETCH_SCOPE_SHORTLIST = SCHEMA_FETCH_SCOPE_SHORTLIST
@@ -191,6 +203,13 @@ class CachedDailyDigest:
 
 
 @dataclass(slots=True, frozen=True)
+class ResolvedProfileSelection:
+    profile_source: str
+    zotero_export_path: Path | None = None
+    zotero_db_path: Path | None = None
+
+
+@dataclass(slots=True, frozen=True)
 class DailyBootstrapResult:
     digest: DailyDigest
     cache_path: Path
@@ -204,6 +223,7 @@ class RangeDigestCollection:
     requested_dates: tuple[date, ...]
     completed_dates: tuple[date, ...]
     child_digests: tuple[DailyDigest, ...]
+    failures: tuple[RequestWindowFailure, ...]
     failure_reasons: tuple[str, ...]
     failed_date: date | None = None
     failed_source: str = ""
@@ -251,6 +271,11 @@ class DailyRunSummary:
     enhanced_track: str
     enhanced_item_count: int
     runtime_note: str
+    llm_requested: bool
+    llm_applied: bool
+    llm_provider: str | None
+    llm_fallback_reason: str | None
+    llm_seconds: float | None
     report_status: str
     report_error: str
     fetch_scope: str
@@ -299,6 +324,8 @@ class RankedPaperCard:
     is_recommended: bool
     why_label: str
     why_it_surfaced: str
+    score_explanation: str
+    relevance_explanation: str
     zotero_effect_label: str
     score_breakdown: tuple[tuple[str, float], ...]
     score_detail_lines: tuple[str, ...]
@@ -414,49 +441,32 @@ class FrontierCompassApp:
     ) -> DailySourceSnapshot:
         normalized_source = str(source or "").strip().lower()
         if normalized_source == "arxiv":
-            category_papers, network_seconds, parse_seconds = self.arxiv_client.fetch_today_by_category_with_timings(
-                BIOMEDICAL_DISCOVERY_CATEGORIES,
-                today=target_date,
-                max_results=None,
-            )
-            papers = merge_category_papers(category_papers)
-            return DailySourceSnapshot(
-                source="arxiv",
-                requested_date=target_date,
-                generated_at=datetime.now(timezone.utc),
-                endpoint=self.arxiv_client.api_url,
-                papers=tuple(papers),
-                fetched_count=sum(len(items) for items in category_papers.values()),
-                status="ready" if papers else "empty",
-                note="Daily arXiv bundle snapshot across biomedical and AI-adjacent discovery categories.",
-                network_seconds=network_seconds,
-                parse_seconds=parse_seconds,
-                metadata={
-                    "categories": list(BIOMEDICAL_DISCOVERY_CATEGORIES),
-                    "feed_urls": {
-                        category: self.arxiv_client.build_feed_url(category)
-                        for category in BIOMEDICAL_DISCOVERY_CATEGORIES
-                    },
-                },
-            )
+            return self._fetch_arxiv_source_snapshot(target_date=target_date)
         if normalized_source == "biorxiv":
             papers, network_seconds, parse_seconds = self.biorxiv_client.fetch_today_with_timings(
                 today=target_date,
                 subject="all",
                 max_results=None,
             )
+            fetch_details = _last_feed_fetch_details(self.biorxiv_client)
             return DailySourceSnapshot(
                 source="biorxiv",
                 requested_date=target_date,
                 generated_at=datetime.now(timezone.utc),
-                endpoint=self.biorxiv_client.build_feed_url("all"),
+                endpoint=(fetch_details.endpoint if fetch_details is not None else self.biorxiv_client.build_feed_url("all")),
                 papers=tuple(papers),
                 fetched_count=len(papers),
                 status="ready" if papers else "empty",
-                note="Daily bioRxiv all-subject local snapshot.",
+                note=_compose_source_note(
+                    "Daily bioRxiv all-subject local snapshot.",
+                    fetch_details,
+                ),
                 network_seconds=network_seconds,
                 parse_seconds=parse_seconds,
-                metadata={"subject": "all"},
+                metadata={
+                    "subject": "all",
+                    "contract_mode": fetch_details.contract_mode if fetch_details is not None else "rss",
+                },
             )
         if normalized_source == "medrxiv":
             papers, network_seconds, parse_seconds = self.medrxiv_client.fetch_today_with_timings(
@@ -464,20 +474,97 @@ class FrontierCompassApp:
                 subject="all",
                 max_results=None,
             )
+            fetch_details = _last_feed_fetch_details(self.medrxiv_client)
             return DailySourceSnapshot(
                 source="medrxiv",
                 requested_date=target_date,
                 generated_at=datetime.now(timezone.utc),
-                endpoint=self.medrxiv_client.build_feed_url("all"),
+                endpoint=(fetch_details.endpoint if fetch_details is not None else self.medrxiv_client.build_feed_url("all")),
                 papers=tuple(papers),
                 fetched_count=len(papers),
                 status="ready" if papers else "empty",
-                note="Daily medRxiv all-subject local snapshot.",
+                note=_compose_source_note(
+                    "Daily medRxiv all-subject local snapshot.",
+                    fetch_details,
+                ),
                 network_seconds=network_seconds,
                 parse_seconds=parse_seconds,
-                metadata={"subject": "all"},
+                metadata={
+                    "subject": "all",
+                    "contract_mode": fetch_details.contract_mode if fetch_details is not None else "rss",
+                },
             )
         raise ValueError(f"Unsupported snapshot source: {source}")
+
+    def _fetch_arxiv_source_snapshot(self, *, target_date: date) -> DailySourceSnapshot:
+        category_papers, network_seconds, parse_seconds = self.arxiv_client.fetch_today_by_category_with_timings(
+            BIOMEDICAL_DISCOVERY_CATEGORIES,
+            today=target_date,
+            max_results=None,
+        )
+        papers = merge_category_papers(category_papers)
+        fetched_count = sum(len(items) for items in category_papers.values())
+        feed_urls = {
+            category: self.arxiv_client.build_feed_url(category)
+            for category in BIOMEDICAL_DISCOVERY_CATEGORIES
+        }
+        query_definitions: tuple[ArxivQueryDefinition, ...] = ()
+        contract_mode = "rss-category"
+        note = "Daily arXiv bundle snapshot across biomedical and AI-adjacent discovery categories."
+
+        if not papers:
+            query_definitions = build_biomedical_discovery_queries(categories=BIOMEDICAL_DISCOVERY_CATEGORIES)
+            try:
+                query_papers, query_network_seconds, query_parse_seconds = self.arxiv_client.fetch_today_by_queries_with_timings(
+                    query_definitions,
+                    today=target_date,
+                    max_results=240,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "arXiv daily category feeds returned no same-day entries and the biomedical API fallback failed: "
+                    f"{exc}"
+                ) from exc
+            papers = merge_paper_batches(query_papers)
+            fetched_count = sum(len(items) for items in query_papers.values())
+            network_seconds = _sum_known_seconds(network_seconds, query_network_seconds)
+            parse_seconds = _sum_known_seconds(parse_seconds, query_parse_seconds)
+            contract_mode = "rss-category+api-query-fallback"
+            if papers:
+                note = (
+                    "Daily arXiv bundle snapshot across biomedical and AI-adjacent discovery categories. "
+                    "The live category Atom feeds returned no same-day entries, so the snapshot reused the "
+                    "biomedical discovery API query fallback."
+                )
+            else:
+                note = (
+                    "Daily arXiv bundle snapshot across biomedical and AI-adjacent discovery categories. "
+                    "The live category Atom feeds returned no same-day entries, and the biomedical discovery "
+                    "API fallback also returned no same-day entries."
+                )
+
+        metadata: dict[str, Any] = {
+            "categories": list(BIOMEDICAL_DISCOVERY_CATEGORIES),
+            "feed_urls": feed_urls,
+            "contract_mode": contract_mode,
+        }
+        if query_definitions:
+            metadata["search_queries"] = [definition.query for definition in query_definitions]
+            metadata["query_profiles"] = list(_query_profile_metadata(query_definitions))
+
+        return DailySourceSnapshot(
+            source="arxiv",
+            requested_date=target_date,
+            generated_at=datetime.now(timezone.utc),
+            endpoint=self.arxiv_client.api_url,
+            papers=tuple(papers),
+            fetched_count=fetched_count,
+            status="ready" if papers else "empty",
+            note=note,
+            network_seconds=network_seconds,
+            parse_seconds=parse_seconds,
+            metadata=metadata,
+        )
 
     def run(
         self,
@@ -508,6 +595,10 @@ class FrontierCompassApp:
         category: str = DEFAULT_ARXIV_CATEGORY,
         mode: str | None = None,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         today: date | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
@@ -519,8 +610,15 @@ class FrontierCompassApp:
         zotero_collections: Sequence[str] = (),
         fetch_scope: str = FETCH_SCOPE_DAY_FULL,
         refresh_sources: bool = False,
+        apply_enhanced_report: bool = True,
     ) -> DailyDigest:
         target_date = today or date.today()
+        llm_settings = resolve_frontier_report_llm_settings(
+            provider=llm_provider,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            model=llm_model,
+        )
         target_date, start_date, end_date, normalized_fetch_scope = normalize_request_window_inputs(
             requested_date=target_date,
             start_date=start_date,
@@ -530,7 +628,7 @@ class FrontierCompassApp:
         if normalized_fetch_scope == FETCH_SCOPE_RANGE_FULL or start_date is not None or end_date is not None:
             resolved_start = start_date or target_date
             resolved_end = end_date or resolved_start
-            return self._build_range_digest(
+            digest = self._build_range_digest(
                 category=category,
                 mode=mode,
                 report_mode=report_mode,
@@ -544,10 +642,15 @@ class FrontierCompassApp:
                 zotero_collections=zotero_collections,
                 refresh_sources=refresh_sources,
             )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
+            )
         selected_source = mode or category
         resolved_bundle = self.resolve_source_bundle(selected_source)
         if resolved_bundle is not None:
-            return self._build_source_bundle_digest(
+            digest = self._build_source_bundle_digest(
                 bundle=resolved_bundle,
                 target_date=target_date,
                 max_results=max_results,
@@ -559,9 +662,14 @@ class FrontierCompassApp:
                 zotero_collections=zotero_collections,
                 refresh_sources=refresh_sources,
             )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
+            )
         resolved_mode = normalize_fixed_daily_mode(mode)
         if resolved_mode == BIOMEDICAL_LATEST_MODE:
-            return self._build_biomedical_latest_digest(
+            digest = self._build_biomedical_latest_digest(
                 target_date=target_date,
                 max_results=max_results,
                 report_mode=report_mode,
@@ -569,9 +677,14 @@ class FrontierCompassApp:
                 profile_source=profile_source,
                 zotero_export_path=zotero_export_path,
                 zotero_db_path=zotero_db_path,
+            )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
             )
         if resolved_mode == BIOMEDICAL_DISCOVERY_MODE:
-            return self._build_biomedical_discovery_digest(
+            digest = self._build_biomedical_discovery_digest(
                 target_date=target_date,
                 max_results=max_results,
                 report_mode=report_mode,
@@ -579,9 +692,14 @@ class FrontierCompassApp:
                 profile_source=profile_source,
                 zotero_export_path=zotero_export_path,
                 zotero_db_path=zotero_db_path,
+            )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
             )
         if resolved_mode == BIOMEDICAL_DAILY_MODE:
-            return self._build_biomedical_daily_digest(
+            digest = self._build_biomedical_daily_digest(
                 target_date=target_date,
                 max_results=max_results,
                 report_mode=report_mode,
@@ -589,9 +707,14 @@ class FrontierCompassApp:
                 profile_source=profile_source,
                 zotero_export_path=zotero_export_path,
                 zotero_db_path=zotero_db_path,
+            )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
             )
         if resolved_mode == BIOMEDICAL_MULTISOURCE_MODE:
-            return self._build_biomedical_multisource_digest(
+            digest = self._build_biomedical_multisource_digest(
                 target_date=target_date,
                 max_results=max_results,
                 report_mode=report_mode,
@@ -600,8 +723,13 @@ class FrontierCompassApp:
                 zotero_export_path=zotero_export_path,
                 zotero_db_path=zotero_db_path,
             )
+            return (
+                self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+                if apply_enhanced_report
+                else digest
+            )
 
-        return self._build_single_category_digest(
+        digest = self._build_single_category_digest(
             category=category,
             target_date=target_date,
             max_results=max_results,
@@ -612,6 +740,11 @@ class FrontierCompassApp:
             zotero_export_path=zotero_export_path,
             zotero_db_path=zotero_db_path,
         )
+        return (
+            self._digest_for_report_mode(digest, report_mode=report_mode, llm_settings=llm_settings)
+            if apply_enhanced_report
+            else digest
+        )
 
     def write_daily_outputs(
         self,
@@ -619,6 +752,10 @@ class FrontierCompassApp:
         category: str = DEFAULT_ARXIV_CATEGORY,
         mode: str | None = None,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         today: date | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
@@ -638,6 +775,10 @@ class FrontierCompassApp:
             category=category,
             mode=mode,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             today=today,
             start_date=start_date,
             end_date=end_date,
@@ -686,7 +827,11 @@ class FrontierCompassApp:
         )
         resolved_cache_path.parent.mkdir(parents=True, exist_ok=True)
         resolved_report_path.parent.mkdir(parents=True, exist_ok=True)
-        self._write_daily_report(digest=digest, output_path=resolved_report_path)
+        self._write_daily_report(
+            digest=digest,
+            output_path=resolved_report_path,
+            acquisition_status_label=display_source_label(DISPLAY_SOURCE_FRESH),
+        )
         self._write_daily_digest_cache(digest=digest, cache_path=resolved_cache_path)
         return DailyPreparationResult(digest=digest, cache_path=resolved_cache_path, report_path=resolved_report_path)
 
@@ -807,6 +952,10 @@ class FrontierCompassApp:
         force_fetch: bool = False,
         allow_stale_cache: bool = True,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         profile_source: str | None = None,
         zotero_export_path: str | Path | None = None,
         zotero_db_path: str | Path | None = None,
@@ -823,6 +972,10 @@ class FrontierCompassApp:
             force_fetch=force_fetch,
             allow_stale_cache=allow_stale_cache,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             profile_source=profile_source,
             zotero_export_path=zotero_export_path,
             zotero_db_path=zotero_db_path,
@@ -849,6 +1002,10 @@ class FrontierCompassApp:
         zotero_collections: Sequence[str] = (),
         allow_stale_cache: bool = False,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         fetch_scope: str = FETCH_SCOPE_DAY_FULL,
     ) -> DailyBootstrapResult:
         return self.load_or_materialize_current_digest(
@@ -868,6 +1025,10 @@ class FrontierCompassApp:
             zotero_collections=zotero_collections,
             allow_stale_cache=allow_stale_cache,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             fetch_scope=fetch_scope,
         )
 
@@ -890,14 +1051,31 @@ class FrontierCompassApp:
         zotero_collections: Sequence[str] = (),
         allow_stale_cache: bool = True,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         fetch_scope: str = FETCH_SCOPE_DAY_FULL,
     ) -> DailyBootstrapResult:
+        llm_settings = resolve_frontier_report_llm_settings(
+            provider=llm_provider,
+            base_url=llm_base_url,
+            api_key=llm_api_key,
+            model=llm_model,
+        )
         requested_date, start_date, end_date, normalized_fetch_scope = normalize_request_window_inputs(
             requested_date=requested_date,
             start_date=start_date,
             end_date=end_date,
             fetch_scope=fetch_scope,
         )
+        resolved_profile_source = _resolve_effective_profile_source(
+            profile_source,
+            zotero_export_path=zotero_export_path,
+            zotero_db_path=zotero_db_path,
+        )
+        if resolved_profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+            zotero_db_path = _resolve_live_zotero_db_path(zotero_db_path)
         resolved_cache_path = (
             Path(cache_path)
             if cache_path is not None
@@ -954,10 +1132,12 @@ class FrontierCompassApp:
             adjusted_digest = self._digest_for_report_mode(
                 same_day_cached.digest,
                 report_mode=report_mode,
+                llm_settings=llm_settings,
             )
             adjusted_digest = self._apply_cache_lookup_timing_to_digest(
                 adjusted_digest,
                 cache_lookup_seconds=cache_lookup_seconds,
+                preserve_stage_timings=False,
             )
             adjusted_digest = self._apply_cache_story_to_digest(
                 adjusted_digest,
@@ -999,8 +1179,17 @@ class FrontierCompassApp:
             write_kwargs["zotero_collections"] = tuple(zotero_collections)
         if report_mode != DEFAULT_REPORT_MODE:
             write_kwargs["report_mode"] = report_mode
+        if llm_provider is not None:
+            write_kwargs["llm_provider"] = llm_provider
+        if llm_base_url is not None:
+            write_kwargs["llm_base_url"] = llm_base_url
+        if llm_api_key is not None:
+            write_kwargs["llm_api_key"] = llm_api_key
+        if llm_model is not None:
+            write_kwargs["llm_model"] = llm_model
         write_kwargs["cache_lookup_seconds"] = cache_lookup_seconds
-        write_kwargs["refresh_sources"] = force_fetch
+        if force_fetch:
+            write_kwargs["refresh_sources"] = True
 
         try:
             if normalized_fetch_scope == FETCH_SCOPE_RANGE_FULL:
@@ -1016,6 +1205,10 @@ class FrontierCompassApp:
                     force_fetch=force_fetch,
                     allow_stale_cache=allow_stale_cache,
                     report_mode=report_mode,
+                    llm_provider=llm_provider,
+                    llm_base_url=llm_base_url,
+                    llm_api_key=llm_api_key,
+                    llm_model=llm_model,
                     feed_url=feed_url,
                     profile_source=profile_source,
                     zotero_export_path=zotero_export_path,
@@ -1046,6 +1239,7 @@ class FrontierCompassApp:
                 adjusted_digest = self._digest_for_report_mode(
                     same_day_cached.digest,
                     report_mode=report_mode,
+                    llm_settings=llm_settings,
                 )
                 adjusted_digest = self._apply_cache_lookup_timing_to_digest(
                     adjusted_digest,
@@ -1100,7 +1294,11 @@ class FrontierCompassApp:
                 stale_cached.digest,
                 requested_date=requested_date,
             )
-            stale_digest = self._digest_for_report_mode(stale_digest, report_mode=report_mode)
+            stale_digest = self._digest_for_report_mode(
+                stale_digest,
+                report_mode=report_mode,
+                llm_settings=llm_settings,
+            )
             stale_digest = self._apply_cache_lookup_timing_to_digest(
                 stale_digest,
                 cache_lookup_seconds=cache_lookup_seconds,
@@ -1151,6 +1349,10 @@ class FrontierCompassApp:
         force_fetch: bool,
         allow_stale_cache: bool,
         report_mode: str,
+        llm_provider: str | None,
+        llm_base_url: str | None,
+        llm_api_key: str | None,
+        llm_model: str | None,
         feed_url: str | None,
         profile_source: str | None,
         zotero_export_path: str | Path | None,
@@ -1174,7 +1376,11 @@ class FrontierCompassApp:
                 zotero_db_path=zotero_db_path,
                 zotero_collections=zotero_collections,
                 allow_stale_cache=allow_stale_cache,
-                report_mode=report_mode,
+                report_mode=DEFAULT_REPORT_MODE,
+                llm_provider=llm_provider,
+                llm_base_url=llm_base_url,
+                llm_api_key=llm_api_key,
+                llm_model=llm_model,
                 fetch_scope=FETCH_SCOPE_DAY_FULL,
             ).digest,
         )
@@ -1582,6 +1788,8 @@ class FrontierCompassApp:
         arxiv_query_papers: dict[str, list[PaperRecord]] = {}
         biorxiv_papers: list[PaperRecord] = []
         medrxiv_papers: list[PaperRecord] = []
+        biorxiv_details: FeedFetchDetails | None = None
+        medrxiv_details: FeedFetchDetails | None = None
         arxiv_network_seconds: float | None = None
         arxiv_parse_seconds: float | None = None
         try:
@@ -1626,10 +1834,12 @@ class FrontierCompassApp:
                 subject="all",
                 max_results=None,
             )
+            biorxiv_details = _last_feed_fetch_details(self.biorxiv_client)
             source_timings["biorxiv"] = build_run_timings(
                 network_seconds=biorxiv_network_seconds,
                 parse_seconds=biorxiv_parse_seconds,
             )
+            source_notes["biorxiv"] = _compose_source_note("", biorxiv_details)
         except Exception as exc:
             source_errors["biorxiv"] = str(exc)
             biorxiv_papers = []
@@ -1639,10 +1849,12 @@ class FrontierCompassApp:
                 subject="all",
                 max_results=None,
             )
+            medrxiv_details = _last_feed_fetch_details(self.medrxiv_client)
             source_timings["medrxiv"] = build_run_timings(
                 network_seconds=medrxiv_network_seconds,
                 parse_seconds=medrxiv_parse_seconds,
             )
+            source_notes["medrxiv"] = _compose_source_note("", medrxiv_details)
         except Exception as exc:
             source_errors["medrxiv"] = str(exc)
             medrxiv_papers = []
@@ -1677,8 +1889,8 @@ class FrontierCompassApp:
         request_window = build_request_window(requested_date=target_date)
         source_endpoints = {
             "arxiv": self.arxiv_client.api_url,
-            "biorxiv": self.biorxiv_client.build_feed_url("all"),
-            "medrxiv": self.medrxiv_client.build_feed_url("all"),
+            "biorxiv": biorxiv_details.endpoint if biorxiv_details is not None else self.biorxiv_client.build_feed_url("all"),
+            "medrxiv": medrxiv_details.endpoint if medrxiv_details is not None else self.medrxiv_client.build_feed_url("all"),
         }
         displayed_counts = {
             **{source: 0 for source in MULTISOURCE_EXPECTED_SOURCES},
@@ -1741,14 +1953,14 @@ class FrontierCompassApp:
                 query_profiles=_query_profile_metadata(zotero_query_definitions),
             ),
             "biorxiv": _build_source_contract_metadata(
-                mode="rss",
+                mode=biorxiv_details.contract_mode if biorxiv_details is not None else "rss",
                 native_filters=("all",),
-                native_endpoints={"all": self.biorxiv_client.build_feed_url("all")},
+                native_endpoints={"all": source_endpoints["biorxiv"]},
             ),
             "medrxiv": _build_source_contract_metadata(
-                mode="rss",
+                mode=medrxiv_details.contract_mode if medrxiv_details is not None else "rss",
                 native_filters=("all",),
-                native_endpoints={"all": self.medrxiv_client.build_feed_url("all")},
+                native_endpoints={"all": source_endpoints["medrxiv"]},
             ),
         }
         return DailyDigest(
@@ -1779,10 +1991,11 @@ class FrontierCompassApp:
             report_status="ready" if not source_errors else "partial",
             report_error="; ".join(source_errors.values()),
             mode_notes=(
-                "Strict same-day multisource biomedical scouting across the fixed q-bio arXiv bundle plus "
-                "bioRxiv and medRxiv all-subject feeds. When a Zotero export is provided, a bounded arXiv "
-                "query-augmentation layer may add extra same-day biomedical candidates before deterministic "
-                "ranking, while source provenance remains explicit on every surfaced paper."
+                "Compatibility-only 3-source biomedical scouting across the fixed q-bio arXiv bundle plus "
+                "bioRxiv and medRxiv all-subject feeds. This path is no longer the default public release "
+                "contract. When a Zotero export is provided, a bounded arXiv query-augmentation layer may "
+                "add extra same-day biomedical candidates before deterministic ranking, while source "
+                "provenance remains explicit on every surfaced paper."
             ),
             search_profile_label=ZOTERO_RETRIEVAL_PROFILE_LABEL if zotero_query_definitions else "",
             search_queries=tuple(definition.query for definition in zotero_query_definitions),
@@ -1938,6 +2151,7 @@ class FrontierCompassApp:
         requested_dates = tuple(_iter_requested_dates(start_date, end_date))
         completed_dates: list[date] = []
         child_digests: list[DailyDigest] = []
+        failures: list[RequestWindowFailure] = []
         failure_reasons: list[str] = []
         failed_date: date | None = None
         failed_source = ""
@@ -1947,12 +2161,19 @@ class FrontierCompassApp:
             try:
                 child_digest = child_loader(requested_day)
             except Exception as exc:
-                failure_reasons.append(str(exc))
+                reason = str(exc)
+                failure_reasons.append(reason)
+                _append_request_window_failure(
+                    failures,
+                    failed_date=requested_day,
+                    failed_source=_range_default_failed_source(category),
+                    failure_reason=reason,
+                )
                 if failed_date is None:
                     failed_date = requested_day
                     if not failed_source:
                         failed_source = _range_default_failed_source(category)
-                break
+                continue
 
             child_digests.append(child_digest)
             completed_dates.append(requested_day)
@@ -1962,16 +2183,38 @@ class FrontierCompassApp:
                 if not reason:
                     source_errors = [row.error for row in child_digest.source_run_stats if row.error]
                     reason = " | ".join(source_errors) if source_errors else ""
-                failure_reasons.append(reason)
+                if reason:
+                    failure_reasons.append(reason)
+                if child_digest.request_window.failure_entries:
+                    for failure in child_digest.request_window.failure_entries:
+                        if failure not in failures:
+                            failures.append(failure)
+                else:
+                    _append_request_window_failure(
+                        failures,
+                        failed_date=requested_day,
+                        failed_source=_infer_failed_source_from_digest(child_digest),
+                        failure_reason=reason,
+                    )
                 if failed_date is None:
-                    failed_date = requested_day
+                    first_failure = failures[0] if failures else None
+                    failed_date = (
+                        first_failure.date
+                        if first_failure is not None and first_failure.date is not None
+                        else requested_day
+                    )
                     if not failed_source:
-                        failed_source = _infer_failed_source_from_digest(child_digest)
+                        failed_source = (
+                            first_failure.source
+                            if first_failure is not None
+                            else _infer_failed_source_from_digest(child_digest)
+                        )
 
         return RangeDigestCollection(
             requested_dates=requested_dates,
             completed_dates=tuple(completed_dates),
             child_digests=tuple(child_digests),
+            failures=tuple(failures),
             failure_reasons=tuple(failure_reasons),
             failed_date=failed_date,
             failed_source=failed_source,
@@ -2006,6 +2249,7 @@ class FrontierCompassApp:
             end_date=end_date,
             status=status,
             completed_dates=collection.completed_dates,
+            failures=collection.failures,
             failed_date=collection.failed_date,
             failed_source=collection.failed_source,
             failure_reason=failure_reason,
@@ -2049,11 +2293,7 @@ class FrontierCompassApp:
                     search_queries.append(query)
 
         base_digest = collection.child_digests[-1]
-        expected_sources = (
-            MULTISOURCE_EXPECTED_SOURCES
-            if base_digest.source == "multisource"
-            else ("arxiv",)
-        )
+        expected_sources = _expected_sources_for_digest(base_digest)
         source_run_stats = _aggregate_range_source_run_stats(
             collection.child_digests,
             expected_sources=expected_sources,
@@ -2123,12 +2363,17 @@ class FrontierCompassApp:
             source_metadata=source_metadata,
             mode_label=f"{base_digest.mode_label} range",
             mode_kind=f"{base_digest.mode_kind}-range",
-            requested_report_mode=base_digest.requested_report_mode,
-            report_mode=base_digest.report_mode,
-            cost_mode=base_digest.cost_mode,
-            enhanced_track=base_digest.enhanced_track,
-            enhanced_item_count=base_digest.enhanced_item_count,
-            runtime_note=base_digest.runtime_note,
+            requested_report_mode=str(runtime_contract["requested_report_mode"]),
+            report_mode=str(runtime_contract["report_mode"]),
+            cost_mode=str(runtime_contract["cost_mode"]),
+            enhanced_track=str(runtime_contract["enhanced_track"]),
+            enhanced_item_count=int(runtime_contract["enhanced_item_count"]),
+            runtime_note=str(runtime_contract["runtime_note"]),
+            llm_requested=bool(runtime_contract["llm_requested"]),
+            llm_applied=bool(runtime_contract["llm_applied"]),
+            llm_provider=runtime_contract["llm_provider"],
+            llm_fallback_reason=runtime_contract["llm_fallback_reason"],
+            llm_seconds=runtime_contract["llm_seconds"],
             report_status="ready" if status == "complete" else "partial",
             report_error=failure_reason,
             fetch_scope=FETCH_SCOPE_RANGE_FULL,
@@ -2174,7 +2419,7 @@ class FrontierCompassApp:
             child_loader=lambda requested_day: self.build_daily_digest(
                 category=category,
                 mode=mode,
-                report_mode=report_mode,
+                report_mode=DEFAULT_REPORT_MODE,
                 today=requested_day,
                 max_results=max_results,
                 feed_url=feed_url,
@@ -2184,6 +2429,7 @@ class FrontierCompassApp:
                 zotero_collections=zotero_collections,
                 fetch_scope=FETCH_SCOPE_DAY_FULL,
                 refresh_sources=refresh_sources,
+                apply_enhanced_report=False,
             ),
         )
         return self._aggregate_range_child_digests(
@@ -2238,6 +2484,10 @@ class FrontierCompassApp:
                 )
             except Exception as exc:
                 source_errors[source] = str(exc)
+
+        for source, snapshot, _loaded_from_cache in loaded_snapshots:
+            if snapshot.endpoint:
+                source_endpoints[source] = snapshot.endpoint
 
         if not loaded_snapshots and source_errors:
             raise RuntimeError("; ".join(f"{format_source_label(source)}: {message}" for source, message in source_errors.items()))
@@ -2337,7 +2587,11 @@ class FrontierCompassApp:
             source_counts={row.source: row.displayed_count for row in source_run_stats},
         )
         exploration_picks = self._daily_exploration_picks(ranked, profile, policy=exploration_policy)
-        source_metadata = self._bundle_source_metadata(bundle)
+        source_metadata = self._bundle_source_metadata(
+            bundle,
+            source_endpoints=source_endpoints,
+            source_snapshots={source: snapshot for source, snapshot, _loaded_from_cache in loaded_snapshots},
+        )
         return DailyDigest(
             source="multisource" if len(bundle.enabled_sources) > 1 else bundle.enabled_sources[0],
             category=bundle.bundle_id,
@@ -2378,9 +2632,19 @@ class FrontierCompassApp:
             used_latest_available_fallback=False,
         )
 
-    def _bundle_source_metadata(self, bundle: SourceBundleDefinition) -> dict[str, dict[str, Any]]:
+    def _bundle_source_metadata(
+        self,
+        bundle: SourceBundleDefinition,
+        *,
+        source_endpoints: Mapping[str, str] | None = None,
+        source_snapshots: Mapping[str, DailySourceSnapshot] | None = None,
+    ) -> dict[str, dict[str, Any]]:
         metadata: dict[str, dict[str, Any]] = {}
+        resolved_source_endpoints = dict(source_endpoints or {})
+        resolved_snapshots = dict(source_snapshots or {})
         for source in bundle.enabled_sources:
+            snapshot = resolved_snapshots.get(source)
+            snapshot_metadata = dict(snapshot.metadata or {}) if snapshot is not None else {}
             if source == "arxiv":
                 metadata[source] = _build_source_contract_metadata(
                     mode="snapshot",
@@ -2391,14 +2655,18 @@ class FrontierCompassApp:
                     },
                     search_endpoint=self.arxiv_client.api_url,
                     search_profile_label=bundle.label,
+                    contract_mode=str(snapshot_metadata.get("contract_mode", "")),
+                    search_queries=tuple(snapshot_metadata.get("search_queries", ()) or ()),
+                    query_profiles=tuple(snapshot_metadata.get("query_profiles", ()) or ()),
                 )
                 continue
-            endpoint = self._source_endpoint_for(source)
+            endpoint = resolved_source_endpoints.get(source) or self._source_endpoint_for(source)
             metadata[source] = _build_source_contract_metadata(
                 mode="snapshot",
                 native_filters=("all",),
                 native_endpoints={"all": endpoint} if endpoint else None,
                 search_profile_label=bundle.label,
+                contract_mode=str(snapshot_metadata.get("contract_mode", "")),
             )
         return metadata
 
@@ -2739,18 +3007,28 @@ class FrontierCompassApp:
     ) -> UserInterestProfile:
         resolved_bundle = self.resolve_source_bundle(category)
         baseline = self._bundle_daily_profile(resolved_bundle) if resolved_bundle is not None else self.daily_profile(category)
-        normalized_source = normalize_profile_source(profile_source)
-        if profile_source is not None and normalized_source is None:
-            raise ValueError(f"Unsupported profile_source: {profile_source}")
+        normalized_source = resolve_requested_profile_source(
+            profile_source,
+            zotero_export_path=zotero_export_path,
+            zotero_db_path=zotero_db_path,
+        )
         if normalized_source == PROFILE_SOURCE_BASELINE:
             return baseline
-        wants_zotero = normalized_source in {
-            PROFILE_SOURCE_ZOTERO,
-            PROFILE_SOURCE_ZOTERO_EXPORT,
-            PROFILE_SOURCE_LIVE_ZOTERO_DB,
-        }
-        if not wants_zotero and zotero_export_path is None and zotero_db_path is None:
-            return baseline
+        if normalized_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+            resolved_db_path = _resolve_live_zotero_db_path(zotero_db_path)
+            filtered_items = filter_items_by_collections(
+                load_sqlite_library(resolved_db_path),
+                zotero_collections,
+            )
+            return self.profile_builder.build_augmented_profile_from_items(
+                baseline,
+                items=filtered_items,
+                profile_source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
+                profile_label="Live Zotero DB",
+                profile_path=str(resolved_db_path.resolve()),
+                db_name=resolved_db_path.name,
+                selected_collections=zotero_collections,
+            )
         export_state = ensure_local_zotero_export(
             export_path=zotero_export_path or self.zotero_export_path,
             status_path=self.zotero_status_path,
@@ -2758,10 +3036,8 @@ class FrontierCompassApp:
             refresh=False,
         )
         if not export_state.ready:
-            if normalized_source == PROFILE_SOURCE_ZOTERO_EXPORT and zotero_export_path is not None:
+            if zotero_export_path is not None:
                 raise ValueError(f"Zotero export not found: {zotero_export_path}")
-            if normalized_source == PROFILE_SOURCE_LIVE_ZOTERO_DB and zotero_db_path is not None and export_state.error:
-                raise ValueError(export_state.error)
             if export_state.error:
                 raise ValueError(export_state.error)
             raise ValueError("No local Zotero library was discovered and no reusable export is available.")
@@ -2772,8 +3048,8 @@ class FrontierCompassApp:
         return self.profile_builder.build_augmented_profile_from_items(
             baseline,
             items=filtered_items,
-            profile_source=PROFILE_SOURCE_ZOTERO,
-            profile_label="Zotero",
+            profile_source=PROFILE_SOURCE_ZOTERO_EXPORT,
+            profile_label="Zotero Export",
             profile_path=str(export_state.export_path.resolve()),
             export_name=export_state.export_path.name,
             selected_collections=zotero_collections,
@@ -3050,12 +3326,17 @@ class FrontierCompassApp:
             fetch_error=fetch_error,
         )
         del report_html
+        resolved_report_seconds = (
+            digest.run_timings.report_seconds
+            if digest.run_timings.report_seconds is not None
+            else report_seconds
+        )
         digest.run_timings = build_run_timings(
             cache_seconds=digest.run_timings.cache_seconds,
             network_seconds=digest.run_timings.network_seconds,
             parse_seconds=digest.run_timings.parse_seconds,
             rank_seconds=digest.run_timings.rank_seconds,
-            report_seconds=report_seconds,
+            report_seconds=resolved_report_seconds,
         )
         digest.report_status = resolved_report_status
         digest.report_error = resolved_report_error
@@ -3322,15 +3603,16 @@ class FrontierCompassApp:
         digest: DailyDigest,
         *,
         cache_lookup_seconds: float | None,
+        preserve_stage_timings: bool = True,
     ) -> DailyDigest:
         if cache_lookup_seconds is None:
             return digest
         updated_run_timings = build_run_timings(
             cache_seconds=cache_lookup_seconds,
-            network_seconds=digest.run_timings.network_seconds,
-            parse_seconds=digest.run_timings.parse_seconds,
-            rank_seconds=digest.run_timings.rank_seconds,
-            report_seconds=digest.run_timings.report_seconds,
+            network_seconds=digest.run_timings.network_seconds if preserve_stage_timings else None,
+            parse_seconds=digest.run_timings.parse_seconds if preserve_stage_timings else None,
+            rank_seconds=digest.run_timings.rank_seconds if preserve_stage_timings else None,
+            report_seconds=digest.run_timings.report_seconds if preserve_stage_timings else None,
         )
         updated_frontier_report = (
             replace(
@@ -3351,18 +3633,84 @@ class FrontierCompassApp:
         digest: DailyDigest,
         *,
         report_mode: str,
+        llm_settings: FrontierReportLLMSettings | None = None,
     ) -> DailyDigest:
-        runtime_contract = build_report_runtime_contract(report_mode)
         frontier_report = digest.frontier_report
-        adjusted_frontier_report = (
-            replace(frontier_report, **runtime_contract)
+        resolved_settings = llm_settings or resolve_frontier_report_llm_settings()
+        deterministic_frontier_report = (
+            self._restore_deterministic_frontier_report(frontier_report)
             if frontier_report is not None
             else None
         )
+        if report_mode == DEFAULT_REPORT_MODE or deterministic_frontier_report is None:
+            runtime_contract = build_report_runtime_contract(report_mode)
+            adjusted_frontier_report = (
+                replace(deterministic_frontier_report, **runtime_contract)
+                if deterministic_frontier_report is not None
+                else None
+            )
+            return replace(
+                digest,
+                frontier_report=adjusted_frontier_report,
+                **runtime_contract,
+            )
+
+        if not resolved_settings.configured:
+            runtime_contract = build_report_runtime_contract(
+                report_mode,
+                llm_provider=resolved_settings.provider_label,
+                llm_fallback_reason=frontier_report_llm_unavailable_reason(resolved_settings),
+            )
+            return replace(
+                digest,
+                frontier_report=replace(deterministic_frontier_report, **runtime_contract),
+                **runtime_contract,
+            )
+
+        llm_started = perf_counter()
+        try:
+            llm_result = build_model_assisted_frontier_report(
+                deterministic_frontier_report,
+                settings=resolved_settings,
+            )
+        except (FrontierReportLLMConfigurationError, FrontierReportLLMError) as exc:
+            runtime_contract = build_report_runtime_contract(
+                report_mode,
+                llm_provider=resolved_settings.provider_label,
+                llm_fallback_reason=str(exc),
+            )
+            return replace(
+                digest,
+                frontier_report=replace(deterministic_frontier_report, **runtime_contract),
+                **runtime_contract,
+            )
+
+        runtime_contract = build_report_runtime_contract(
+            report_mode,
+            llm_provider=resolved_settings.provider_label,
+            llm_applied=True,
+            llm_seconds=perf_counter() - llm_started,
+            enhanced_item_count=llm_result.enhanced_item_count,
+        )
         return replace(
             digest,
-            frontier_report=adjusted_frontier_report,
+            frontier_report=replace(llm_result.report, **runtime_contract),
             **runtime_contract,
+        )
+
+    @staticmethod
+    def _restore_deterministic_frontier_report(frontier_report):
+        if frontier_report is None:
+            return None
+        deterministic_takeaways = frontier_report.deterministic_takeaways or frontier_report.takeaways
+        deterministic_field_highlights = (
+            frontier_report.deterministic_field_highlights
+            or frontier_report.field_highlights
+        )
+        return replace(
+            frontier_report,
+            takeaways=deterministic_takeaways,
+            field_highlights=deterministic_field_highlights,
         )
 
     @staticmethod
@@ -3399,7 +3747,7 @@ class FrontierCompassApp:
                     ),
                     error=row_error,
                     note=_merge_cache_story_note(normalized_item.note, note, fetch_error=fetch_error),
-                    timings=RunTimings(),
+                    timings=normalized_item.timings,
                 )
             )
         return tuple(rewritten_rows)
@@ -3436,6 +3784,10 @@ class FrontierCompassApp:
             report_status = "partial"
         current_run_timings = build_run_timings(
             cache_seconds=digest.run_timings.cache_seconds,
+            network_seconds=digest.run_timings.network_seconds,
+            parse_seconds=digest.run_timings.parse_seconds,
+            rank_seconds=digest.run_timings.rank_seconds,
+            report_seconds=digest.run_timings.report_seconds,
         )
         rewritten_frontier_report = (
             replace(
@@ -3477,7 +3829,7 @@ class FrontierCompassApp:
         normalized_fetch_scope = normalize_fetch_scope(fetch_scope)
         cached_fetch_scope = normalize_fetch_scope(
             cached.digest.fetch_scope,
-            default=FETCH_SCOPE_SHORTLIST,
+            default=FETCH_SCOPE_DAY_FULL,
         )
         if normalized_fetch_scope == FETCH_SCOPE_RANGE_FULL:
             if cached.digest.request_window.kind != "range":
@@ -3594,6 +3946,11 @@ def build_daily_run_summary(
         enhanced_track=digest.enhanced_track,
         enhanced_item_count=digest.enhanced_item_count,
         runtime_note=digest.runtime_note,
+        llm_requested=digest.llm_requested,
+        llm_applied=digest.llm_applied,
+        llm_provider=digest.llm_provider,
+        llm_fallback_reason=digest.llm_fallback_reason,
+        llm_seconds=digest.llm_seconds,
         report_status=digest.report_status,
         report_error=digest.report_error,
         fetch_scope=digest.fetch_scope,
@@ -3661,8 +4018,8 @@ def format_daily_source_label(selected_source: str) -> str:
     if bundle is not None:
         return bundle.label
     labels = {
-        BIOMEDICAL_LATEST_MODE: "Biomedical reviewer brief (recommended)",
-        BIOMEDICAL_MULTISOURCE_MODE: "Biomedical multisource brief",
+        BIOMEDICAL_LATEST_MODE: "Legacy latest-available biomedical mode",
+        BIOMEDICAL_MULTISOURCE_MODE: "Compatibility 3-source run",
         BIOMEDICAL_DISCOVERY_MODE: "Biomedical discovery brief",
         BIOMEDICAL_DAILY_MODE: "Biomedical q-bio bundle",
     }
@@ -3706,6 +4063,82 @@ def build_existing_local_file_url(path: str | Path | None) -> str:
     return resolved.resolve().as_uri()
 
 
+def resolve_default_profile_selection(
+    *,
+    profile_source: str | None = None,
+    explicit_zotero_export_path: str | Path | None = None,
+    explicit_zotero_db_path: str | Path | None = None,
+    default_zotero_export_path: str | Path | None = None,
+    default_zotero_db_path: str | Path | None = None,
+    reusable_zotero_export_path: str | Path = DEFAULT_ZOTERO_EXPORT_PATH,
+) -> ResolvedProfileSelection:
+    normalized_profile_source = normalize_profile_source(profile_source)
+    if profile_source is not None and normalized_profile_source is None:
+        raise ValueError(f"Unsupported profile_source: {profile_source}")
+
+    explicit_export = Path(explicit_zotero_export_path) if explicit_zotero_export_path is not None else None
+    explicit_db = Path(explicit_zotero_db_path) if explicit_zotero_db_path is not None else None
+    default_export = Path(default_zotero_export_path) if default_zotero_export_path is not None else None
+    default_db = Path(default_zotero_db_path) if default_zotero_db_path is not None else None
+    reusable_export = Path(reusable_zotero_export_path)
+
+    if normalized_profile_source is not None:
+        if normalized_profile_source == PROFILE_SOURCE_BASELINE:
+            return ResolvedProfileSelection(profile_source=PROFILE_SOURCE_BASELINE)
+        if normalized_profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+            return ResolvedProfileSelection(
+                profile_source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
+                zotero_db_path=explicit_db or default_db,
+            )
+        return ResolvedProfileSelection(
+            profile_source=PROFILE_SOURCE_ZOTERO_EXPORT,
+            zotero_export_path=(
+                explicit_export
+                or _preferred_reusable_zotero_export_path(
+                    default_export_path=default_export,
+                    reusable_export_path=reusable_export,
+                )
+            ),
+            zotero_db_path=explicit_db,
+        )
+
+    if explicit_export is not None and explicit_db is not None:
+        resolve_requested_profile_source(
+            None,
+            zotero_export_path=explicit_export,
+            zotero_db_path=explicit_db,
+        )
+    if explicit_db is not None:
+        return ResolvedProfileSelection(
+            profile_source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
+            zotero_db_path=explicit_db,
+        )
+    if explicit_export is not None:
+        return ResolvedProfileSelection(
+            profile_source=PROFILE_SOURCE_ZOTERO_EXPORT,
+            zotero_export_path=explicit_export,
+        )
+
+    readable_default_db = _readable_zotero_db_path(default_db)
+    if readable_default_db is not None:
+        return ResolvedProfileSelection(
+            profile_source=PROFILE_SOURCE_LIVE_ZOTERO_DB,
+            zotero_db_path=readable_default_db,
+        )
+
+    readable_export = _preferred_reusable_zotero_export_path(
+        default_export_path=default_export,
+        reusable_export_path=reusable_export,
+    )
+    if readable_export is not None:
+        return ResolvedProfileSelection(
+            profile_source=PROFILE_SOURCE_ZOTERO_EXPORT,
+            zotero_export_path=readable_export,
+        )
+
+    return ResolvedProfileSelection(profile_source=PROFILE_SOURCE_BASELINE)
+
+
 def normalize_request_window_inputs(
     *,
     requested_date: date,
@@ -3722,6 +4155,8 @@ def normalize_request_window_inputs(
         resolved_start = requested_date
     if resolved_start is not None and resolved_end is not None and resolved_end < resolved_start:
         resolved_start, resolved_end = resolved_end, resolved_start
+    if resolved_start is not None and resolved_end is not None and resolved_start == resolved_end:
+        return resolved_start, None, None, FETCH_SCOPE_DAY_FULL
     if resolved_start is not None or resolved_end is not None:
         normalized_fetch_scope = FETCH_SCOPE_RANGE_FULL
         return resolved_start or requested_date, resolved_start, resolved_end, normalized_fetch_scope
@@ -3733,7 +4168,7 @@ def build_ranked_paper_cards(
     *,
     profile: UserInterestProfile | None = None,
     recommended_threshold: float = DEFAULT_RECOMMENDED_SCORE_THRESHOLD,
-    why_label: str = "Why it surfaced",
+    why_label: str = "Why this paper",
     why_overrides: Mapping[str, str] | None = None,
 ) -> list[RankedPaperCard]:
     return [
@@ -3788,6 +4223,37 @@ def format_author_summary(authors: Sequence[str]) -> str:
     return f"{authors[0]} +{len(authors) - 1} more"
 
 
+def _preferred_reusable_zotero_export_path(
+    *,
+    default_export_path: Path | None,
+    reusable_export_path: Path,
+) -> Path | None:
+    readable_default_export = _readable_zotero_export_path(default_export_path)
+    if readable_default_export is not None:
+        return readable_default_export
+    readable_reusable_export = _readable_zotero_export_path(reusable_export_path)
+    if readable_reusable_export is not None:
+        return readable_reusable_export
+    return default_export_path if default_export_path is not None else None
+
+
+def _readable_zotero_export_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    try:
+        load_csl_json_export(path)
+    except (OSError, ValueError):
+        return None
+    return path
+
+
+def _readable_zotero_db_path(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    discovered_path, _error, _candidate_paths = discover_local_zotero_db_details(db_path=path)
+    return discovered_path
+
+
 def _build_ranked_paper_card(
     item: RankedPaper,
     *,
@@ -3797,7 +4263,7 @@ def _build_ranked_paper_card(
     why_override: str | None,
 ) -> RankedPaperCard:
     explanation = recommendation_explanation_for_ranked_paper(item, profile=profile)
-    why_line = why_override if why_override is not None else explanation_summary_line(explanation)
+    why_line = why_override if why_override is not None else why_this_paper_line(explanation)
     return RankedPaperCard(
         title=item.paper.title,
         source_label=format_source_label(item.paper.source),
@@ -3812,6 +4278,8 @@ def _build_ranked_paper_card(
         is_recommended=item.score >= recommended_threshold,
         why_label=why_label,
         why_it_surfaced=why_line,
+        score_explanation=score_explanation_line(explanation),
+        relevance_explanation=interest_relevance_line(explanation),
         zotero_effect_label=zotero_effect_badge_text(explanation.zotero_effect),
         score_breakdown=explanation_breakdown_rows(explanation),
         score_detail_lines=explanation_detail_lines(explanation),
@@ -3866,17 +4334,44 @@ def _profile_output_suffix(
         zotero_export_path=zotero_export_path,
         zotero_db_path=zotero_db_path,
     )
-    if normalized_source != PROFILE_SOURCE_ZOTERO:
+    if normalized_source == PROFILE_SOURCE_BASELINE:
         return ""
+    if normalized_source == PROFILE_SOURCE_ZOTERO_EXPORT:
+        return _zotero_export_profile_output_suffix(
+            zotero_export_path=zotero_export_path,
+            zotero_collections=zotero_collections,
+        )
+    return _live_zotero_profile_output_suffix(
+        zotero_db_path=_resolve_live_zotero_db_path(zotero_db_path),
+        zotero_collections=zotero_collections,
+    )
+
+
+def _zotero_export_profile_output_suffix(
+    *,
+    zotero_export_path: str | Path | None = None,
+    zotero_collections: Sequence[str] = (),
+) -> str:
     selection_suffix = _zotero_collection_suffix(zotero_collections)
     resolved_export_path = Path(zotero_export_path) if zotero_export_path is not None else DEFAULT_ZOTERO_EXPORT_PATH
-    path = Path(resolved_export_path)
-    stem = _slug_category(path.stem)
-    digest = sha1(str(path.resolve()).encode("utf-8")).hexdigest()[:8]
+    stem = _slug_category(resolved_export_path.stem)
+    digest = sha1(str(resolved_export_path.resolve()).encode("utf-8")).hexdigest()[:8]
+    return f"_profile-zotero-export-{stem}-{digest}{selection_suffix}"
+
+
+def _legacy_zotero_export_profile_output_suffix(
+    *,
+    zotero_export_path: str | Path | None = None,
+    zotero_collections: Sequence[str] = (),
+) -> str:
+    selection_suffix = _zotero_collection_suffix(zotero_collections)
+    resolved_export_path = Path(zotero_export_path) if zotero_export_path is not None else DEFAULT_ZOTERO_EXPORT_PATH
+    stem = _slug_category(resolved_export_path.stem)
+    digest = sha1(str(resolved_export_path.resolve()).encode("utf-8")).hexdigest()[:8]
     return f"_zotero-{stem}-{digest}{selection_suffix}"
 
 
-def _legacy_live_zotero_profile_output_suffix(
+def _live_zotero_profile_output_suffix(
     *,
     zotero_db_path: str | Path,
     zotero_collections: Sequence[str] = (),
@@ -3903,35 +4398,43 @@ def _cache_matches_profile_compatibility(
         zotero_export_path=zotero_export_path,
         zotero_db_path=zotero_db_path,
     )
-    candidate_is_profile_specific = "_zotero-" in cache_name or "_profile-live-zotero-db-" in cache_name
-    if normalized_source == PROFILE_SOURCE_ZOTERO:
+    candidate_is_profile_specific = (
+        "_zotero-" in cache_name
+        or "_profile-zotero-export-" in cache_name
+        or "_profile-live-zotero-db-" in cache_name
+    )
+    if normalized_source == PROFILE_SOURCE_ZOTERO_EXPORT:
         resolved_export_path = Path(zotero_export_path) if zotero_export_path is not None else DEFAULT_ZOTERO_EXPORT_PATH
-        expected_suffix = _profile_output_suffix(
-            PROFILE_SOURCE_ZOTERO,
+        expected_suffix = _zotero_export_profile_output_suffix(
+            zotero_export_path=resolved_export_path,
+            zotero_collections=zotero_collections,
+        )
+        legacy_suffix = _legacy_zotero_export_profile_output_suffix(
             zotero_export_path=resolved_export_path,
             zotero_collections=zotero_collections,
         )
         if (
-            cache_name.endswith(expected_suffix)
-            and digest.profile.profile_source in {PROFILE_SOURCE_ZOTERO, PROFILE_SOURCE_ZOTERO_EXPORT}
-            and digest.profile.zotero_export_name == resolved_export_path.name
+            cache_name.endswith(expected_suffix) or cache_name.endswith(legacy_suffix)
+        ) and digest.profile.profile_source == PROFILE_SOURCE_ZOTERO_EXPORT and (
+            digest.profile.zotero_export_name == resolved_export_path.name
             and _normalize_collection_selection(digest.profile.zotero_selected_collections)
             == _normalize_collection_selection(zotero_collections)
         ):
             return True
-        if zotero_db_path is not None:
-            legacy_suffix = _legacy_live_zotero_profile_output_suffix(
-                zotero_db_path=zotero_db_path,
-                zotero_collections=zotero_collections,
-            )
-            return (
-                cache_name.endswith(legacy_suffix)
-                and digest.profile.profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB
-                and digest.profile.zotero_db_name == Path(zotero_db_path).name
-                and _normalize_collection_selection(digest.profile.zotero_selected_collections)
-                == _normalize_collection_selection(zotero_collections)
-            )
         return False
+    if normalized_source == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+        resolved_db_path = _resolve_live_zotero_db_path(zotero_db_path)
+        expected_suffix = _live_zotero_profile_output_suffix(
+            zotero_db_path=resolved_db_path,
+            zotero_collections=zotero_collections,
+        )
+        return (
+            cache_name.endswith(expected_suffix)
+            and digest.profile.profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB
+            and digest.profile.zotero_db_name == resolved_db_path.name
+            and _normalize_collection_selection(digest.profile.zotero_selected_collections)
+            == _normalize_collection_selection(zotero_collections)
+        )
     return not candidate_is_profile_specific and digest.profile.profile_source == PROFILE_SOURCE_BASELINE
 
 
@@ -3941,20 +4444,20 @@ def _resolve_effective_profile_source(
     zotero_export_path: str | Path | None = None,
     zotero_db_path: str | Path | None = None,
 ) -> str:
-    normalized_source = normalize_profile_source(profile_source)
-    if profile_source is not None and normalized_source is None:
-        raise ValueError(f"Unsupported profile_source: {profile_source}")
-    if normalized_source == PROFILE_SOURCE_BASELINE:
-        return PROFILE_SOURCE_BASELINE
-    if normalized_source in {
-        PROFILE_SOURCE_ZOTERO,
-        PROFILE_SOURCE_ZOTERO_EXPORT,
-        PROFILE_SOURCE_LIVE_ZOTERO_DB,
-    }:
-        return PROFILE_SOURCE_ZOTERO
-    if zotero_db_path is not None or zotero_export_path is not None:
-        return PROFILE_SOURCE_ZOTERO
-    return PROFILE_SOURCE_BASELINE
+    return resolve_requested_profile_source(
+        profile_source,
+        zotero_export_path=zotero_export_path,
+        zotero_db_path=zotero_db_path,
+    )
+
+
+def _resolve_live_zotero_db_path(zotero_db_path: str | Path | None) -> Path:
+    resolved_db_path, error, _candidate_paths = discover_local_zotero_db_details(
+        db_path=zotero_db_path,
+    )
+    if resolved_db_path is None:
+        raise ValueError(error or "No readable local Zotero library was discovered.")
+    return resolved_db_path
 
 
 def _normalize_collection_selection(values: Sequence[str] | None) -> tuple[str, ...]:
@@ -4055,10 +4558,12 @@ def build_request_window(
     end_date: date | None = None,
     status: str = "complete",
     completed_dates: Sequence[date] = (),
+    failures: Sequence[RequestWindowFailure] = (),
     failed_date: date | None = None,
     failed_source: str = "",
     failure_reason: str = "",
 ) -> RequestWindow:
+    resolved_failures = tuple(failures)
     if start_date is not None or end_date is not None:
         resolved_start = start_date or requested_date
         resolved_end = end_date or resolved_start
@@ -4069,6 +4574,7 @@ def build_request_window(
             end_date=resolved_end,
             status=status,
             completed_dates=tuple(completed_dates),
+            failures=resolved_failures,
             failed_date=failed_date,
             failed_source=failed_source,
             failure_reason=failure_reason,
@@ -4078,6 +4584,7 @@ def build_request_window(
         requested_date=requested_date,
         status=status,
         completed_dates=tuple(completed_dates),
+        failures=resolved_failures,
         failed_date=failed_date,
         failed_source=failed_source,
         failure_reason=failure_reason,
@@ -4095,9 +4602,43 @@ def _join_unique_messages(messages: Sequence[str]) -> str:
 
 def _range_default_failed_source(category: str) -> str:
     normalized = _normalize_category(category)
-    if normalized == BIOMEDICAL_MULTISOURCE_MODE:
+    bundle = resolve_source_bundle(normalized, config_path=DEFAULT_SOURCE_BUNDLES_PATH)
+    if normalized == BIOMEDICAL_MULTISOURCE_MODE or (bundle is not None and len(bundle.enabled_sources) > 1):
         return ""
     return "arxiv"
+
+
+def _build_request_window_failure(
+    *,
+    failed_date: date | None,
+    failed_source: str = "",
+    failure_reason: str = "",
+) -> RequestWindowFailure | None:
+    normalized_source = str(failed_source or "").strip().lower()
+    normalized_reason = " ".join(str(failure_reason or "").split())
+    if failed_date is None and not normalized_source and not normalized_reason:
+        return None
+    return RequestWindowFailure(
+        date=failed_date,
+        source=normalized_source,
+        reason=normalized_reason,
+    )
+
+
+def _append_request_window_failure(
+    failures: list[RequestWindowFailure],
+    *,
+    failed_date: date | None,
+    failed_source: str = "",
+    failure_reason: str = "",
+) -> None:
+    failure = _build_request_window_failure(
+        failed_date=failed_date,
+        failed_source=failed_source,
+        failure_reason=failure_reason,
+    )
+    if failure is not None and failure not in failures:
+        failures.append(failure)
 
 
 def _infer_failed_source_from_digest(digest: DailyDigest) -> str:
@@ -4247,12 +4788,25 @@ def _derive_live_source_outcome(
     return SOURCE_OUTCOME_UNKNOWN_LEGACY
 
 
+def _normalize_cache_status(cache_status: str | None, *, default: str = CACHE_STATUS_FRESH) -> str:
+    normalized = str(cache_status or default).strip().lower()
+    aliases = {
+        "same-day cache": CACHE_STATUS_SAME_DAY,
+        "same-date-cache": CACHE_STATUS_SAME_DAY,
+        "same-date cache": CACHE_STATUS_SAME_DAY,
+        "stale-cache": CACHE_STATUS_STALE,
+        "stale compatible cache": CACHE_STATUS_STALE,
+        CACHE_STATUS_STALE: CACHE_STATUS_STALE,
+    }
+    return aliases.get(normalized, normalized or default)
+
+
 def _derive_current_source_outcome(
     *,
     cache_status: str,
     live_outcome: str,
 ) -> str:
-    normalized_cache_status = (cache_status or CACHE_STATUS_FRESH).strip().lower()
+    normalized_cache_status = _normalize_cache_status(cache_status)
     normalized_live_outcome = (live_outcome or "").strip().lower()
     if normalized_cache_status == CACHE_STATUS_SAME_DAY:
         return (
@@ -4274,6 +4828,7 @@ def _derive_current_source_outcome(
 def _normalize_source_run_outcome(row: SourceRunStats) -> SourceRunStats:
     normalized_live_outcome = (row.live_outcome or "").strip().lower()
     normalized_outcome = (row.outcome or "").strip().lower()
+    normalized_cache_status = _normalize_cache_status(row.cache_status)
     if not normalized_live_outcome:
         if normalized_outcome in {
             SOURCE_OUTCOME_LIVE_SUCCESS,
@@ -4282,7 +4837,7 @@ def _normalize_source_run_outcome(row: SourceRunStats) -> SourceRunStats:
             SOURCE_OUTCOME_UNKNOWN_LEGACY,
         }:
             normalized_live_outcome = normalized_outcome
-        elif row.cache_status == CACHE_STATUS_FRESH:
+        elif normalized_cache_status == CACHE_STATUS_FRESH:
             normalized_live_outcome = _derive_live_source_outcome(
                 fetched_count=row.fetched_count,
                 displayed_count=row.displayed_count,
@@ -4300,6 +4855,7 @@ def _normalize_source_run_outcome(row: SourceRunStats) -> SourceRunStats:
         return row
     return replace(
         row,
+        cache_status=normalized_cache_status,
         outcome=normalized_outcome,
         live_outcome=normalized_live_outcome,
     )
@@ -4380,7 +4936,9 @@ def build_source_run_stats(
             error=error,
             status=status,
         )
-        resolved_cache_status = cache_status_lookup.get(normalized, cache_status)
+        resolved_cache_status = _normalize_cache_status(
+            cache_status_lookup.get(normalized, cache_status)
+        )
         rows.append(
             SourceRunStats(
                 source=normalized,
@@ -4454,7 +5012,10 @@ def _dedupe_note_clauses(note: str) -> str:
 
 
 def _expected_sources_for_digest(digest: DailyDigest) -> tuple[str, ...]:
-    if digest.source == "multisource" or digest.category == BIOMEDICAL_MULTISOURCE_MODE:
+    resolved_bundle = resolve_source_bundle(digest.category, config_path=DEFAULT_SOURCE_BUNDLES_PATH)
+    if resolved_bundle is not None:
+        return resolved_bundle.enabled_sources
+    if digest.category == BIOMEDICAL_MULTISOURCE_MODE or digest.source == "multisource":
         return MULTISOURCE_EXPECTED_SOURCES
     if digest.source:
         return ((digest.source or "arxiv").strip().lower() or "arxiv",)
@@ -4554,11 +5115,28 @@ def _count_papers_by_source(papers: Sequence[PaperRecord] | Sequence[object]) ->
     return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
+def _last_feed_fetch_details(client: object) -> FeedFetchDetails | None:
+    details = getattr(client, "last_fetch_details", None)
+    if isinstance(details, FeedFetchDetails):
+        return details
+    return None
+
+
+def _compose_source_note(base_note: str, details: FeedFetchDetails | None) -> str:
+    return _join_unique_messages(
+        [
+            str(base_note or "").strip(),
+            details.note if details is not None else "",
+        ]
+    )
+
+
 def _build_source_contract_metadata(
     *,
     mode: str,
     native_filters: Sequence[str] = (),
     native_endpoints: Mapping[str, str] | None = None,
+    contract_mode: str = "",
     search_endpoint: str = "",
     search_queries: Sequence[str] = (),
     search_profile_label: str = "",
@@ -4575,6 +5153,8 @@ def _build_source_contract_metadata(
             for key, value in native_endpoints.items()
             if str(key) and str(value)
         }
+    if contract_mode:
+        metadata["contract_mode"] = contract_mode
     if search_endpoint:
         metadata["search_endpoint"] = search_endpoint
     if search_queries:

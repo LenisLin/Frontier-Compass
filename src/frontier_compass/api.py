@@ -32,6 +32,10 @@ def _extend_optional_run_kwargs(
     start_date: date | None = None,
     end_date: date | None = None,
     report_mode: str = DEFAULT_REPORT_MODE,
+    llm_provider: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_model: str | None = None,
     profile_source: str | None = None,
     zotero_export_path: str | Path | None = None,
     zotero_db_path: str | Path | None = None,
@@ -50,6 +54,14 @@ def _extend_optional_run_kwargs(
         kwargs["end_date"] = end_date
     if report_mode != DEFAULT_REPORT_MODE:
         kwargs["report_mode"] = report_mode
+    if llm_provider is not None:
+        kwargs["llm_provider"] = llm_provider
+    if llm_base_url is not None:
+        kwargs["llm_base_url"] = llm_base_url
+    if llm_api_key is not None:
+        kwargs["llm_api_key"] = llm_api_key
+    if llm_model is not None:
+        kwargs["llm_model"] = llm_model
     if profile_source is not None:
         kwargs["profile_source"] = profile_source
     if zotero_export_path is not None:
@@ -198,6 +210,10 @@ class FrontierCompassRunner:
         refresh: bool = False,
         allow_stale_cache: bool = True,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         cache_dir: str | Path = DEFAULT_DAILY_CACHE_DIR,
         cache_path: str | Path | None = None,
         report_path: str | Path | None = None,
@@ -225,6 +241,10 @@ class FrontierCompassRunner:
             start_date=start_date,
             end_date=end_date,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             profile_source=profile_source,
             zotero_export_path=zotero_export_path,
             zotero_db_path=zotero_db_path,
@@ -268,6 +288,10 @@ class FrontierCompassRunner:
         refresh: bool = False,
         allow_stale_cache: bool = True,
         report_mode: str = DEFAULT_REPORT_MODE,
+        llm_provider: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        llm_model: str | None = None,
         cache_dir: str | Path = DEFAULT_DAILY_CACHE_DIR,
         report_dir: str | Path = DEFAULT_DAILY_REPORT_DIR,
         profile_source: str | None = None,
@@ -291,6 +315,10 @@ class FrontierCompassRunner:
             start_date=start_date,
             end_date=end_date,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_api_key=llm_api_key,
+            llm_model=llm_model,
             profile_source=profile_source,
             zotero_export_path=zotero_export_path,
             zotero_db_path=zotero_db_path,
@@ -330,6 +358,10 @@ def run_daily(
     refresh: bool = False,
     allow_stale_cache: bool = True,
     report_mode: str = DEFAULT_REPORT_MODE,
+    llm_provider: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_model: str | None = None,
     cache_dir: str | Path = DEFAULT_DAILY_CACHE_DIR,
     cache_path: str | Path | None = None,
     report_path: str | Path | None = None,
@@ -351,6 +383,10 @@ def run_daily(
         refresh=refresh,
         allow_stale_cache=allow_stale_cache,
         report_mode=report_mode,
+        llm_provider=llm_provider,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
         cache_dir=cache_dir,
         cache_path=cache_path,
         report_path=report_path,
@@ -388,6 +424,10 @@ def prepare_ui_session(
     refresh: bool = False,
     allow_stale_cache: bool = True,
     report_mode: str = DEFAULT_REPORT_MODE,
+    llm_provider: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_model: str | None = None,
     cache_dir: str | Path = DEFAULT_DAILY_CACHE_DIR,
     report_dir: str | Path = DEFAULT_DAILY_REPORT_DIR,
     profile_source: str | None = None,
@@ -408,6 +448,10 @@ def prepare_ui_session(
         refresh=refresh,
         allow_stale_cache=allow_stale_cache,
         report_mode=report_mode,
+        llm_provider=llm_provider,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
         cache_dir=cache_dir,
         report_dir=report_dir,
         profile_source=profile_source,

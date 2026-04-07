@@ -19,7 +19,7 @@ OFFICIAL_SOURCE_BUNDLE_IDS = (
     SOURCE_BUNDLE_AI_FOR_MEDICINE,
 )
 DEFAULT_PUBLIC_SOURCE_BUNDLE = SOURCE_BUNDLE_BIOMEDICAL
-DEFAULT_ENABLED_SOURCES = ("arxiv", "biorxiv", "medrxiv")
+DEFAULT_ENABLED_SOURCES = ("arxiv", "biorxiv")
 
 _BIOMEDICAL_MATCH_TERMS = (
     "biomedical",
@@ -134,14 +134,19 @@ def official_source_bundles() -> tuple[SourceBundleDefinition, ...]:
         SourceBundleDefinition(
             bundle_id=SOURCE_BUNDLE_BIOMEDICAL,
             label="Biomedical",
-            description="Cross-source biomedical scouting over the cached daily arXiv, bioRxiv, and medRxiv snapshot.",
+            description=(
+                "Default public biomedical scouting over the cached daily arXiv and bioRxiv snapshot. "
+                "medRxiv remains compatibility-only and is not part of the default release path."
+            ),
             enabled_sources=DEFAULT_ENABLED_SOURCES,
             official=True,
         ),
         SourceBundleDefinition(
             bundle_id=SOURCE_BUNDLE_AI_FOR_MEDICINE,
             label="AI for medicine",
-            description="Curated AI-for-medicine track over the same daily local source snapshot.",
+            description=(
+                "Curated AI-for-medicine track over the same daily local arXiv and bioRxiv snapshot."
+            ),
             enabled_sources=DEFAULT_ENABLED_SOURCES,
             official=True,
         ),

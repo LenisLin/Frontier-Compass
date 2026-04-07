@@ -18,11 +18,22 @@ from frontier_compass.api import (
     LocalUISession,
     load_recent_history,
 )
+from frontier_compass.common.frontier_report_llm import (
+    FRONTIER_COMPASS_LLM_API_KEY_ENV,
+    FRONTIER_COMPASS_LLM_BASE_URL_ENV,
+    FRONTIER_COMPASS_LLM_MODEL_ENV,
+    FRONTIER_COMPASS_LLM_PROVIDER_ENV,
+)
 from frontier_compass.common.report_mode import (
     DEFAULT_REPORT_MODE,
     REPORT_MODE_CHOICES,
     ZERO_TOKEN_COST_MODE,
+    format_llm_bool,
+    format_llm_provider,
+    format_llm_seconds,
 )
+from frontier_compass.common.source_bundles import SOURCE_BUNDLE_AI_FOR_MEDICINE
+from frontier_compass.common.source_bundles import SOURCE_BUNDLE_BIOMEDICAL
 from frontier_compass.common.user_defaults import (
     DEFAULT_USER_DEFAULTS_PATH,
     LoadedUserDefaults,
@@ -31,7 +42,12 @@ from frontier_compass.common.user_defaults import (
     resolve_setting,
 )
 from frontier_compass.reporting.daily_brief import summarize_category_counts
-from frontier_compass.storage.schema import DailyDigest, RunTimings, SourceRunStats
+from frontier_compass.storage.schema import (
+    DailyDigest,
+    RunTimings,
+    SourceRunStats,
+    resolve_requested_profile_source,
+)
 from frontier_compass.ui.app import (
     BIOMEDICAL_DAILY_MODE,
     BIOMEDICAL_DISCOVERY_MODE,
@@ -43,7 +59,6 @@ from frontier_compass.ui.app import (
     FETCH_SCOPE_RANGE_FULL,
     PROFILE_SOURCE_BASELINE,
     PROFILE_SOURCE_LIVE_ZOTERO_DB,
-    PROFILE_SOURCE_ZOTERO,
     PROFILE_SOURCE_ZOTERO_EXPORT,
     DEFAULT_REVIEWER_SOURCE,
     FrontierCompassApp,
@@ -51,11 +66,13 @@ from frontier_compass.ui.app import (
     display_source_label,
     format_source_outcome_label,
     is_fixed_daily_mode,
+    resolve_default_profile_selection,
 )
 from frontier_compass.ui.history import (
     build_history_artifact_rows,
-    build_history_summary_bits,
     format_history_requested_effective_label,
+    format_history_compatibility_text,
+    format_history_llm_provenance_text,
 )
 from frontier_compass.ui.email_delivery import (
     default_eml_output_path,
@@ -97,6 +114,25 @@ def _build_ui_launch_command(
     return command
 
 
+def _build_ui_launch_env(
+    *,
+    llm_provider: ResolvedSetting | None = None,
+    llm_base_url: ResolvedSetting | None = None,
+    llm_api_key: ResolvedSetting | None = None,
+    llm_model: ResolvedSetting | None = None,
+) -> dict[str, str]:
+    launch_env = dict(os.environ)
+    if llm_provider is not None and llm_provider.source == "cli" and llm_provider.value:
+        launch_env[FRONTIER_COMPASS_LLM_PROVIDER_ENV] = str(llm_provider.value)
+    if llm_base_url is not None and llm_base_url.source == "cli" and llm_base_url.value:
+        launch_env[FRONTIER_COMPASS_LLM_BASE_URL_ENV] = str(llm_base_url.value)
+    if llm_api_key is not None and llm_api_key.source == "cli" and llm_api_key.value:
+        launch_env[FRONTIER_COMPASS_LLM_API_KEY_ENV] = str(llm_api_key.value)
+    if llm_model is not None and llm_model.source == "cli" and llm_model.value:
+        launch_env[FRONTIER_COMPASS_LLM_MODEL_ENV] = str(llm_model.value)
+    return launch_env
+
+
 def build_parser() -> argparse.ArgumentParser:
     ui_command_hint = format_shell_command(_build_ui_launch_command())
     parser = argparse.ArgumentParser(
@@ -116,23 +152,26 @@ def build_parser() -> argparse.ArgumentParser:
         "run-daily",
         help="Primary local CLI path: materialize or reuse the current digest and report.",
         description=(
-            "Recommended local CLI path. This cache-first wrapper materializes or reuses the current digest, "
-            "ensures the HTML report exists, and can optionally write a dry-run .eml artifact."
+            "Recommended local CLI path. By default this cache-first wrapper uses the public 2-source bundle "
+            "(arXiv + bioRxiv), ensures the HTML report exists, and can optionally write a dry-run .eml "
+            "artifact. medRxiv remains available only through explicit compatibility paths."
         ),
     )
     _add_config_arguments(run_daily_parser)
     _add_daily_source_arguments(
         run_daily_parser,
         default_help=(
-            "Explicit fixed daily mode. If you omit both --mode and --category, run-daily defaults to "
-            f"{DEFAULT_REVIEWER_SOURCE}."
+            "Advanced compatibility source override. If you omit both --mode and --category, run-daily uses "
+            "the default public 2-source bundle (arXiv + bioRxiv). Use biomedical-multisource only for the "
+            "compatibility 3-source path."
         ),
         category_help=(
-            "Strict single-category arXiv RSS path, for example q-bio, q-bio.GN, or cs.LG. "
-            f"If you pass --category without --mode, run-daily skips the {DEFAULT_REVIEWER_SOURCE} default."
+            "Strict single-category arXiv RSS compatibility path, for example q-bio, q-bio.GN, or cs.LG. "
+            "If you pass --category without --mode, run-daily skips the default 2-source bundle."
         ),
     )
     _add_report_mode_argument(run_daily_parser)
+    _add_frontier_report_llm_arguments(run_daily_parser)
     run_daily_parser.add_argument("--today", type=_parse_iso_date, default=argparse.SUPPRESS, help="Override the target date as YYYY-MM-DD.")
     _add_request_window_arguments(run_daily_parser)
     run_daily_parser.add_argument(
@@ -166,7 +205,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--zotero-export",
         type=Path,
         default=argparse.SUPPRESS,
-        help="Optional local Zotero CSL JSON export used to augment the biomedical baseline profile.",
+        help=(
+            "Advanced override for a local Zotero CSL JSON export when you want to bypass config-backed "
+            "defaults or the reusable snapshot."
+        ),
     )
     _add_profile_source_arguments(run_daily_parser)
     run_daily_parser.add_argument(
@@ -225,23 +267,26 @@ def build_parser() -> argparse.ArgumentParser:
         "ui",
         help="Primary local UI path: prewarm the current digest and launch Streamlit.",
         description=(
-            "Recommended local interactive surface. This command can print the exact Streamlit launch "
-            "command or prewarm the current digest before opening the app."
+            "Recommended local interactive surface. The app resolves config-backed Zotero defaults on its own, "
+            "opens the reading-first homepage cache-first, and keeps CLI startup args for explicit overrides "
+            "or exact launch reproduction."
         ),
     )
     _add_config_arguments(ui_parser)
     _add_daily_source_arguments(
         ui_parser,
         default_help=(
-            "Explicit fixed daily mode. If you omit both --mode and --category, ui defaults to "
-            f"{DEFAULT_REVIEWER_SOURCE}."
+            "Advanced compatibility source override. If you omit both --mode and --category, ui uses the "
+            "default public 2-source bundle (arXiv + bioRxiv). Use biomedical-multisource only for the "
+            "compatibility 3-source path."
         ),
         category_help=(
-            "Strict single-category arXiv path, for example q-bio, q-bio.GN, or cs.LG. "
-            f"If you pass --category without --mode, ui skips the {DEFAULT_REVIEWER_SOURCE} default."
+            "Strict single-category arXiv compatibility path, for example q-bio, q-bio.GN, or cs.LG. "
+            "If you pass --category without --mode, ui skips the default 2-source bundle."
         ),
     )
     _add_report_mode_argument(ui_parser)
+    _add_frontier_report_llm_arguments(ui_parser)
     ui_parser.add_argument(
         "--today",
         type=_parse_iso_date,
@@ -263,7 +308,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--zotero-export",
         type=Path,
         default=argparse.SUPPRESS,
-        help="Optional local Zotero CSL JSON export used to augment the UI's active profile.",
+        help=(
+            "Advanced override for a local Zotero CSL JSON export. The normal UI path is to configure "
+            "default_zotero_db_path or default_zotero_export_path in configs/user_defaults.json."
+        ),
     )
     _add_profile_source_arguments(ui_parser)
     ui_parser.add_argument(
@@ -319,28 +367,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     daily_parser = subparsers.add_parser(
         "daily",
-        help="Compatibility explicit build for a fixed mode or strict single feed.",
+        help="Compatibility explicit build for advanced source paths or a strict single feed.",
         description=(
-            "Build the reviewer-ready biomedical digest explicitly. If you omit both --mode and "
-            f"--category, this command uses {DEFAULT_REVIEWER_SOURCE}. Pass --mode for a fixed biomedical "
-            "mode, or pass --category for a strict single-category RSS path."
+            "Compatibility build path. If you omit both --mode and --category, this command still uses the "
+            "default public 2-source bundle. Pass --mode for an advanced bundle or compatibility mode, or "
+            "pass --category for a strict single-category RSS path."
         ),
     )
     _add_config_arguments(daily_parser)
     _add_daily_source_arguments(
         daily_parser,
         default_help=(
-            "Explicit fixed daily mode. If you omit both --mode and --category, daily defaults to "
-            f"{DEFAULT_REVIEWER_SOURCE}. Use biomedical-discovery for the strict same-day hybrid audit path, "
-            "biomedical-daily for the q-bio comparison bundle, or biomedical-multisource for the strict "
-            "same-day arXiv + bioRxiv + medRxiv bundle."
+            "Advanced compatibility source override. If you omit both --mode and --category, daily uses the "
+            "default public 2-source bundle. Use biomedical-discovery for the strict same-day hybrid audit "
+            "path, biomedical-daily for the q-bio comparison bundle, or biomedical-multisource for the "
+            "compatibility 3-source bundle."
         ),
         category_help=(
-            "Strict single-category arXiv RSS path, for example q-bio, q-bio.GN, or cs.LG. "
-            f"If you pass --category without --mode, daily skips the {DEFAULT_REVIEWER_SOURCE} default."
+            "Strict single-category arXiv RSS compatibility path, for example q-bio, q-bio.GN, or cs.LG. "
+            "If you pass --category without --mode, daily skips the default 2-source bundle."
         ),
     )
     _add_report_mode_argument(daily_parser)
+    _add_frontier_report_llm_arguments(daily_parser)
     daily_parser.add_argument("--today", type=_parse_iso_date, default=argparse.SUPPRESS, help="Override the target date as YYYY-MM-DD.")
     _add_request_window_arguments(daily_parser)
     daily_parser.add_argument(
@@ -374,7 +423,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--zotero-export",
         type=Path,
         default=argparse.SUPPRESS,
-        help="Optional local Zotero CSL JSON export used to augment the biomedical baseline profile.",
+        help=(
+            "Advanced override for a local Zotero CSL JSON export when you want to bypass config-backed "
+            "defaults or the reusable snapshot."
+        ),
     )
     _add_profile_source_arguments(daily_parser)
 
@@ -390,15 +442,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_daily_source_arguments(
         deliver_parser,
         default_help=(
-            "Explicit fixed daily mode. If you omit both --mode and --category, deliver-daily defaults to "
-            f"{DEFAULT_REVIEWER_SOURCE}."
+            "Advanced compatibility source override. If you omit both --mode and --category, deliver-daily "
+            "uses the default public 2-source bundle."
         ),
         category_help=(
-            "Strict single-category arXiv RSS path, for example q-bio, q-bio.GN, or cs.LG. "
-            f"If you pass --category without --mode, deliver-daily skips the {DEFAULT_REVIEWER_SOURCE} default."
+            "Strict single-category arXiv RSS compatibility path, for example q-bio, q-bio.GN, or cs.LG. "
+            "If you pass --category without --mode, deliver-daily skips the default 2-source bundle."
         ),
     )
     _add_report_mode_argument(deliver_parser)
+    _add_frontier_report_llm_arguments(deliver_parser)
     deliver_parser.add_argument("--today", type=_parse_iso_date, default=argparse.SUPPRESS, help="Override the target date as YYYY-MM-DD.")
     _add_request_window_arguments(deliver_parser)
     deliver_parser.add_argument(
@@ -427,7 +480,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--zotero-export",
         type=Path,
         default=argparse.SUPPRESS,
-        help="Optional local Zotero CSL JSON export used to augment the biomedical baseline profile.",
+        help=(
+            "Advanced override for a local Zotero CSL JSON export when you want to bypass config-backed "
+            "defaults or the reusable snapshot."
+        ),
     )
     _add_profile_source_arguments(deliver_parser)
     deliver_parser.add_argument(
@@ -533,29 +589,31 @@ def _handle_ui_command(
         requested_date, start_date, end_date, fetch_scope = _resolve_request_window(args)
         selected_source = _resolve_selected_source(args, loaded_defaults)
         report_mode = _resolve_report_mode(args, loaded_defaults)
+        llm_provider = _resolve_llm_provider(args, loaded_defaults)
+        llm_base_url = _resolve_llm_base_url(args, loaded_defaults)
+        llm_api_key = _resolve_llm_api_key(args, loaded_defaults)
+        llm_model = _resolve_llm_model(args, loaded_defaults)
         max_results = _resolve_max_results(args, loaded_defaults)
-        zotero_export = _resolve_zotero_export(args, loaded_defaults)
-        zotero_db = _resolve_zotero_db_path(args)
         zotero_collections = _resolve_zotero_collections(args)
-        profile_source = _resolve_profile_source(
+        profile_source, zotero_export, zotero_db = _resolve_profile_settings(
             args,
-            zotero_export_path=zotero_export.value,
-            zotero_db_path=zotero_db.value,
+            loaded_defaults,
         )
         allow_stale_cache = _resolve_allow_stale_cache(args, loaded_defaults)
         startup_args = _build_ui_startup_args(
-            source=str(selected_source.value),
+            args=args,
+            source=selected_source,
             requested_date=requested_date,
             start_date=start_date,
             end_date=end_date,
-            max_results=int(max_results.value),
-            report_mode=str(report_mode.value),
+            max_results=max_results,
+            report_mode=report_mode,
             profile_source=profile_source,
-            zotero_export_path=zotero_export.value,
-            zotero_db_path=zotero_db.value,
+            zotero_export_path=zotero_export,
+            zotero_db_path=zotero_db,
             zotero_collections=zotero_collections,
             fetch_scope=fetch_scope,
-            allow_stale_cache=bool(allow_stale_cache.value),
+            allow_stale_cache=allow_stale_cache,
         )
         streamlit_app_path = _resolve_ui_app_path()
         command = _build_ui_launch_command(
@@ -573,6 +631,9 @@ def _handle_ui_command(
             settings=_ui_settings(
                 selected_source=selected_source,
                 report_mode=report_mode,
+                llm_provider=llm_provider,
+                llm_base_url=llm_base_url,
+                llm_model=llm_model,
                 max_results=max_results,
                 profile_source=profile_source,
                 zotero_export=zotero_export,
@@ -588,6 +649,12 @@ def _handle_ui_command(
 
     session: LocalUISession | None = None
     prewarm_error = ""
+    launch_env = _build_ui_launch_env(
+        llm_provider=llm_provider,
+        llm_base_url=llm_base_url,
+        llm_api_key=llm_api_key,
+        llm_model=llm_model,
+    )
     try:
         session_kwargs = _extend_optional_runner_kwargs(
             {
@@ -600,7 +667,11 @@ def _handle_ui_command(
             start_date=start_date,
             end_date=end_date,
             report_mode=str(report_mode.value),
-            profile_source=profile_source,
+            llm_provider=llm_provider.value,
+            llm_base_url=llm_base_url.value,
+            llm_api_key=llm_api_key.value,
+            llm_model=llm_model.value,
+            profile_source=profile_source.value,
             zotero_export_path=zotero_export.value,
             zotero_db_path=zotero_db.value,
             zotero_collections=zotero_collections,
@@ -621,12 +692,15 @@ def _handle_ui_command(
     elif prewarm_error:
         print("UI prewarm failed; launching Streamlit without an active digest.", file=sys.stderr)
         print(prewarm_error, file=sys.stderr)
-        print("Use Load selection or Refresh from sources inside the app to retry.", file=sys.stderr)
+        print("Change the date or use Refresh inside the app to retry.", file=sys.stderr)
     _print_resolution_summary(
         loaded_defaults=loaded_defaults,
         settings=_ui_settings(
             selected_source=selected_source,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
             max_results=max_results,
             profile_source=profile_source,
             zotero_export=zotero_export,
@@ -638,7 +712,13 @@ def _handle_ui_command(
     print(f"Refresh prewarm: {'yes' if args.refresh else 'no'}")
     print(f"Launching FrontierCompass UI from {streamlit_app_path}")
     print(f"Command: {format_shell_command(command)}")
-    completed = subprocess.run(command, check=False)
+    subprocess_kwargs: dict[str, object] = {"check": False}
+    if any(
+        resolved.source == "cli" and resolved.value
+        for resolved in (llm_provider, llm_base_url, llm_api_key, llm_model)
+    ):
+        subprocess_kwargs["env"] = launch_env
+    completed = subprocess.run(command, **subprocess_kwargs)
     return completed.returncode
 
 
@@ -655,14 +735,15 @@ def _handle_daily_command(
         if is_fixed_daily_mode(str(selected_source.value)) and feed_url is not None:
             parser.error(f"--feed-url cannot be combined with --mode {selected_source.value}")
         report_mode = _resolve_report_mode(args, loaded_defaults)
+        llm_provider = _resolve_llm_provider(args, loaded_defaults)
+        llm_base_url = _resolve_llm_base_url(args, loaded_defaults)
+        llm_api_key = _resolve_llm_api_key(args, loaded_defaults)
+        llm_model = _resolve_llm_model(args, loaded_defaults)
         max_results = _resolve_max_results(args, loaded_defaults)
-        zotero_export = _resolve_zotero_export(args, loaded_defaults)
-        zotero_db = _resolve_zotero_db_path(args)
         zotero_collections = _resolve_zotero_collections(args)
-        profile_source = _resolve_profile_source(
+        profile_source, zotero_export, zotero_db = _resolve_profile_settings(
             args,
-            zotero_export_path=zotero_export.value,
-            zotero_db_path=zotero_db.value,
+            loaded_defaults,
         )
         run_kwargs = _extend_optional_runner_kwargs(
             {
@@ -678,7 +759,11 @@ def _handle_daily_command(
             start_date=start_date,
             end_date=end_date,
             report_mode=str(report_mode.value),
-            profile_source=profile_source,
+            llm_provider=llm_provider.value,
+            llm_base_url=llm_base_url.value,
+            llm_api_key=llm_api_key.value,
+            llm_model=llm_model.value,
+            profile_source=profile_source.value,
             zotero_export_path=zotero_export.value,
             zotero_db_path=zotero_db.value,
             zotero_collections=zotero_collections,
@@ -701,6 +786,9 @@ def _handle_daily_command(
         settings=(
             ("Selected source", selected_source),
             ("Report mode", report_mode),
+            ("LLM provider", llm_provider),
+            ("LLM base URL", llm_base_url),
+            ("LLM model", llm_model),
             ("Max results", max_results),
             ("Profile source", profile_source),
             ("Zotero export", zotero_export),
@@ -721,14 +809,15 @@ def _handle_deliver_daily_command(
         requested_date, start_date, end_date, fetch_scope = _resolve_request_window(args)
         selected_source = _resolve_selected_source(args, loaded_defaults)
         report_mode = _resolve_report_mode(args, loaded_defaults)
+        llm_provider = _resolve_llm_provider(args, loaded_defaults)
+        llm_base_url = _resolve_llm_base_url(args, loaded_defaults)
+        llm_api_key = _resolve_llm_api_key(args, loaded_defaults)
+        llm_model = _resolve_llm_model(args, loaded_defaults)
         max_results = _resolve_max_results(args, loaded_defaults)
-        zotero_export = _resolve_zotero_export(args, loaded_defaults)
-        zotero_db = _resolve_zotero_db_path(args)
         zotero_collections = _resolve_zotero_collections(args)
-        profile_source = _resolve_profile_source(
+        profile_source, zotero_export, zotero_db = _resolve_profile_settings(
             args,
-            zotero_export_path=zotero_export.value,
-            zotero_db_path=zotero_db.value,
+            loaded_defaults,
         )
         email_to = _resolve_email_to(args, loaded_defaults)
         email_from = _resolve_email_from(args, loaded_defaults)
@@ -745,7 +834,11 @@ def _handle_deliver_daily_command(
             start_date=start_date,
             end_date=end_date,
             report_mode=str(report_mode.value),
-            profile_source=profile_source,
+            llm_provider=llm_provider.value,
+            llm_base_url=llm_base_url.value,
+            llm_api_key=llm_api_key.value,
+            llm_model=llm_model.value,
+            profile_source=profile_source.value,
             zotero_export_path=zotero_export.value,
             zotero_db_path=zotero_db.value,
             zotero_collections=zotero_collections,
@@ -788,6 +881,9 @@ def _handle_deliver_daily_command(
         settings=(
             ("Selected source", selected_source),
             ("Report mode", report_mode),
+            ("LLM provider", llm_provider),
+            ("LLM base URL", llm_base_url),
+            ("LLM model", llm_model),
             ("Max results", max_results),
             ("Profile source", profile_source),
             ("Zotero export", zotero_export),
@@ -819,14 +915,15 @@ def _handle_run_daily_command(
         if is_fixed_daily_mode(str(selected_source.value)) and feed_url is not None:
             parser.error(f"--feed-url cannot be combined with --mode {selected_source.value}")
         report_mode = _resolve_report_mode(args, loaded_defaults)
+        llm_provider = _resolve_llm_provider(args, loaded_defaults)
+        llm_base_url = _resolve_llm_base_url(args, loaded_defaults)
+        llm_api_key = _resolve_llm_api_key(args, loaded_defaults)
+        llm_model = _resolve_llm_model(args, loaded_defaults)
         max_results = _resolve_max_results(args, loaded_defaults)
-        zotero_export = _resolve_zotero_export(args, loaded_defaults)
-        zotero_db = _resolve_zotero_db_path(args)
         zotero_collections = _resolve_zotero_collections(args)
-        profile_source = _resolve_profile_source(
+        profile_source, zotero_export, zotero_db = _resolve_profile_settings(
             args,
-            zotero_export_path=zotero_export.value,
-            zotero_db_path=zotero_db.value,
+            loaded_defaults,
         )
         dry_run_email = _resolve_dry_run_email(args, loaded_defaults)
         allow_stale_cache = _resolve_allow_stale_cache(args, loaded_defaults)
@@ -846,7 +943,11 @@ def _handle_run_daily_command(
             start_date=start_date,
             end_date=end_date,
             report_mode=str(report_mode.value),
-            profile_source=profile_source,
+            llm_provider=llm_provider.value,
+            llm_base_url=llm_base_url.value,
+            llm_api_key=llm_api_key.value,
+            llm_model=llm_model.value,
+            profile_source=profile_source.value,
             zotero_export_path=zotero_export.value,
             zotero_db_path=zotero_db.value,
             zotero_collections=zotero_collections,
@@ -898,6 +999,9 @@ def _handle_run_daily_command(
         settings=_run_daily_settings(
             selected_source=selected_source,
             report_mode=report_mode,
+            llm_provider=llm_provider,
+            llm_base_url=llm_base_url,
+            llm_model=llm_model,
             max_results=max_results,
             profile_source=profile_source,
             zotero_export=zotero_export,
@@ -926,76 +1030,171 @@ def _handle_history_command(args: argparse.Namespace) -> int:
         print("No recent daily runs found under data/cache.")
         return 0
 
-    print("Recent runs (latest first)")
+    current_entries = [entry for entry in history_entries if not entry.is_compatibility_entry]
+    compatibility_entries = [entry for entry in history_entries if entry.is_compatibility_entry]
+
+    print("Recent runs (current-contract first)")
     print()
-    for index, entry in enumerate(history_entries):
-        print(f"{entry.requested_date.isoformat()} | {entry.mode_label}")
-        print(f"Requested -> showing: {format_history_requested_effective_label(entry)}")
-        print(f"Request window: {entry.request_window.label}")
-        print(f"Fetch scope: {entry.fetch_scope}")
-        print(f"Total fetched / displayed: {entry.total_fetched} / {entry.total_displayed}")
-        print(f"Generated: {entry.generated_at.isoformat()}")
-        print(" | ".join(build_history_summary_bits(entry)))
-        if entry.frontier_report_present is not None:
-            print(f"Frontier Report present: {'yes' if entry.frontier_report_present else 'no'}")
-        if entry.source_run_stats:
-            print(f"Sources: {_format_source_run_stats_text(entry.source_run_stats)}")
-        elif entry.source_counts:
-            print(
-                "Sources: "
-                + " | ".join(
-                    f"{source} {count}"
-                    for source, count in sorted(entry.source_counts.items(), key=lambda item: item[0])
-                )
-            )
-        run_timings_text = _format_run_timings_text(entry.run_timings)
-        if run_timings_text:
-            print(f"Run timings: {run_timings_text}")
-        for label, value in build_history_artifact_rows(entry):
-            print(f"{label}: {value}")
-        if index != len(history_entries) - 1:
+    for index, entry in enumerate(current_entries):
+        _print_history_entry(entry)
+        if index != len(current_entries) - 1:
             print()
+    if compatibility_entries:
+        if current_entries:
+            print()
+        print("Compatibility / archived entries")
+        print()
+        for index, entry in enumerate(compatibility_entries):
+            _print_history_entry(entry)
+            if index != len(compatibility_entries) - 1:
+                print()
     return 0
+
+
+def _print_history_entry(entry: object) -> None:
+    if not hasattr(entry, "requested_date") or not hasattr(entry, "generated_at"):
+        return
+    print(f"{entry.requested_date.isoformat()} | {entry.mode_label}")
+    print(f"Requested -> showing: {format_history_requested_effective_label(entry)}")
+    print(f"Request window: {entry.request_window.label}")
+    print(f"Fetch scope: {entry.fetch_scope}")
+    print(f"Total fetched / displayed: {entry.total_fetched} / {entry.total_displayed}")
+    print(f"Generated: {entry.generated_at.isoformat()}")
+    print(" | ".join(_build_cli_history_summary_bits(entry)))
+    if getattr(entry, "is_compatibility_entry", False):
+        print(f"Compatibility: {format_history_compatibility_text(entry)}")
+    if hasattr(entry, "llm_requested"):
+        print(format_history_llm_provenance_text(entry))
+    if entry.frontier_report_present is not None:
+        print(f"Frontier Report present: {'yes' if entry.frontier_report_present else 'no'}")
+    if entry.source_run_stats:
+        print(f"Sources: {_format_source_run_stats_text(entry.source_run_stats)}")
+    elif entry.source_counts:
+        print(
+            "Sources: "
+            + " | ".join(
+                f"{source} {count}"
+                for source, count in sorted(entry.source_counts.items(), key=lambda item: item[0])
+            )
+        )
+    run_timings_text = _format_run_timings_text(entry.run_timings)
+    if run_timings_text:
+        print(f"Run timings: {run_timings_text}")
+    for label, value in build_history_artifact_rows(entry):
+        print(f"{label}: {value}")
+
+
+def _build_cli_history_summary_bits(entry: object) -> tuple[str, ...]:
+    summary_bits = [
+        getattr(entry, "fetch_status", "") or "n/a",
+        f"ranked {getattr(entry, 'ranked_count', 0)}",
+        f"report {getattr(entry, 'report_mode', DEFAULT_REPORT_MODE)}/{getattr(entry, 'report_status', 'ready')}",
+        getattr(entry, "cost_mode", "") or ZERO_TOKEN_COST_MODE,
+        getattr(entry, "profile_label", "") or "n/a",
+    ]
+    source_run_stats = getattr(entry, "source_run_stats", ())
+    source_counts = getattr(entry, "source_counts", {})
+    if source_run_stats:
+        summary_bits.append(
+            " | ".join(
+                _format_cli_history_source_run_stat(row)
+                for row in source_run_stats
+            )
+        )
+    elif source_counts:
+        summary_bits.append(
+            " | ".join(
+                f"{source} {count}"
+                for source, count in sorted(source_counts.items(), key=lambda item: item[0])
+            )
+        )
+    run_timings = getattr(entry, "run_timings", None)
+    total_seconds = getattr(run_timings, "total_seconds", None)
+    if total_seconds is not None:
+        summary_bits.append(f"time {total_seconds:.2f}s")
+    zotero_export_name = getattr(entry, "zotero_export_name", "")
+    zotero_db_name = getattr(entry, "zotero_db_name", "")
+    if zotero_export_name:
+        summary_bits.append(f"zotero {zotero_export_name}")
+    elif zotero_db_name:
+        summary_bits.append(f"zotero-db {zotero_db_name}")
+    elif bool(getattr(entry, "zotero_augmented", False)):
+        summary_bits.append("zotero enabled")
+    exploration_pick_count = getattr(entry, "exploration_pick_count", None)
+    if exploration_pick_count:
+        summary_bits.append(f"exploration {exploration_pick_count}")
+    if getattr(entry, "frontier_report_present", None) is False:
+        summary_bits.append("frontier report unavailable")
+    if getattr(entry, "report_artifact_aligned", None) is False:
+        summary_bits.append("report artifact not aligned")
+    return tuple(summary_bits)
+
+
+def _format_cli_history_source_run_stat(row: object) -> str:
+    piece = (
+        f"{getattr(row, 'source', 'unknown')} "
+        f"{getattr(row, 'fetched_count', 0)}/{getattr(row, 'displayed_count', 0)} "
+        f"[{getattr(row, 'resolved_outcome', '')}; {getattr(row, 'status', '')}; {getattr(row, 'cache_status', '')}]"
+    )
+    extra_bits: list[str] = []
+    resolved_live_outcome = getattr(row, "resolved_live_outcome", "")
+    resolved_outcome = getattr(row, "resolved_outcome", "")
+    if resolved_live_outcome != resolved_outcome:
+        extra_bits.append(f"live: {resolved_live_outcome}")
+    error = getattr(row, "error", "")
+    if error:
+        extra_bits.append(f"error: {error}")
+    note = getattr(row, "note", "")
+    if note:
+        extra_bits.append(f"note: {note}")
+    if extra_bits:
+        return f"{piece} ({'; '.join(extra_bits)})"
+    return piece
 
 
 def _build_ui_startup_args(
     *,
-    source: str,
+    args: argparse.Namespace,
+    source: ResolvedSetting,
     requested_date: date,
     start_date: date | None,
     end_date: date | None,
-    max_results: int,
-    report_mode: str,
+    max_results: ResolvedSetting,
+    report_mode: ResolvedSetting,
     profile_source: ResolvedSetting,
-    zotero_export_path: str | Path | None,
-    zotero_db_path: str | Path | None,
+    zotero_export_path: ResolvedSetting,
+    zotero_db_path: ResolvedSetting,
     zotero_collections: Sequence[str] = (),
     fetch_scope: str,
-    allow_stale_cache: bool,
+    allow_stale_cache: ResolvedSetting,
 ) -> list[str]:
-    startup_args = [
-        "--source",
-        source,
-        "--requested-date",
-        requested_date.isoformat(),
-        "--max-results",
-        str(max(int(max_results), 1)),
-        "--report-mode",
-        report_mode,
-        "--allow-stale-cache" if allow_stale_cache else "--no-stale-cache",
-    ]
+    startup_args: list[str] = []
+    if hasattr(args, "config"):
+        startup_args.extend(["--config", str(args.config)])
+    if bool(_optional_attr(args, "no_config")):
+        startup_args.append("--no-config")
+    if source.source == "cli":
+        startup_args.extend(["--source", str(source.value)])
+    if hasattr(args, "today"):
+        startup_args.extend(["--requested-date", requested_date.isoformat()])
+    if max_results.source == "cli":
+        startup_args.extend(["--max-results", str(max(int(max_results.value), 1))])
+    if report_mode.source == "cli":
+        startup_args.extend(["--report-mode", str(report_mode.value)])
+    if allow_stale_cache.source == "cli":
+        startup_args.append("--allow-stale-cache" if bool(allow_stale_cache.value) else "--no-stale-cache")
     if start_date is not None:
         startup_args.extend(["--start-date", start_date.isoformat()])
     if end_date is not None:
         startup_args.extend(["--end-date", end_date.isoformat()])
-    if profile_source.source != "built-in" or profile_source.value == PROFILE_SOURCE_BASELINE:
+    if profile_source.source == "cli":
         startup_args.extend(["--profile-source", str(profile_source.value)])
     if _should_include_fetch_scope(fetch_scope, start_date=start_date, end_date=end_date):
         startup_args.extend(["--fetch-scope", fetch_scope])
-    if zotero_export_path is not None:
-        startup_args.extend(["--zotero-export", str(Path(zotero_export_path))])
-    if zotero_db_path is not None:
-        startup_args.extend(["--zotero-db-path", str(Path(zotero_db_path))])
+    if zotero_export_path.source == "cli" and zotero_export_path.value is not None:
+        startup_args.extend(["--zotero-export", str(Path(zotero_export_path.value))])
+    if zotero_db_path.source == "cli" and zotero_db_path.value is not None:
+        startup_args.extend(["--zotero-db-path", str(Path(zotero_db_path.value))])
     for collection in zotero_collections:
         startup_args.extend(["--zotero-collection", str(collection)])
     return startup_args
@@ -1012,7 +1211,11 @@ def _extend_optional_runner_kwargs(
     start_date: date | None = None,
     end_date: date | None = None,
     report_mode: str = DEFAULT_REPORT_MODE,
-    profile_source: ResolvedSetting | None = None,
+    llm_provider: str | None = None,
+    llm_base_url: str | None = None,
+    llm_api_key: str | None = None,
+    llm_model: str | None = None,
+    profile_source: str | None = None,
     zotero_export_path: str | Path | None = None,
     zotero_db_path: str | Path | None = None,
     zotero_collections: Sequence[str] = (),
@@ -1024,8 +1227,16 @@ def _extend_optional_runner_kwargs(
         kwargs["end_date"] = end_date
     if report_mode != DEFAULT_REPORT_MODE:
         kwargs["report_mode"] = report_mode
+    if llm_provider is not None:
+        kwargs["llm_provider"] = llm_provider
+    if llm_base_url is not None:
+        kwargs["llm_base_url"] = llm_base_url
+    if llm_api_key is not None:
+        kwargs["llm_api_key"] = llm_api_key
+    if llm_model is not None:
+        kwargs["llm_model"] = llm_model
     if profile_source is not None:
-        kwargs["profile_source"] = profile_source.value
+        kwargs["profile_source"] = profile_source
     kwargs["zotero_export_path"] = zotero_export_path
     if zotero_db_path is not None:
         kwargs["zotero_db_path"] = zotero_db_path
@@ -1061,6 +1272,8 @@ def _add_daily_source_arguments(
     parser.add_argument(
         "--mode",
         choices=(
+            SOURCE_BUNDLE_BIOMEDICAL,
+            SOURCE_BUNDLE_AI_FOR_MEDICINE,
             BIOMEDICAL_LATEST_MODE,
             BIOMEDICAL_MULTISOURCE_MODE,
             BIOMEDICAL_DISCOVERY_MODE,
@@ -1088,6 +1301,29 @@ def _add_report_mode_argument(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_frontier_report_llm_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--llm-provider",
+        default=argparse.SUPPRESS,
+        help="Optional model-assisted Frontier Report provider label. Defaults to openai-compatible when base URL, key, or model is provided.",
+    )
+    parser.add_argument(
+        "--llm-base-url",
+        default=argparse.SUPPRESS,
+        help="OpenAI-compatible base URL for the Frontier Report model call.",
+    )
+    parser.add_argument(
+        "--llm-api-key",
+        default=argparse.SUPPRESS,
+        help="API key for the Frontier Report model call. Prefer config or environment variables for local use.",
+    )
+    parser.add_argument(
+        "--llm-model",
+        default=argparse.SUPPRESS,
+        help="Model id for the Frontier Report model call.",
+    )
+
+
 def _add_request_window_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--start-date",
@@ -1112,23 +1348,22 @@ def _add_request_window_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_profile_source_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--profile-source",
-        choices=(
-            PROFILE_SOURCE_BASELINE,
-            PROFILE_SOURCE_ZOTERO,
-            PROFILE_SOURCE_ZOTERO_EXPORT,
-            PROFILE_SOURCE_LIVE_ZOTERO_DB,
-        ),
         default=argparse.SUPPRESS,
         help=(
-            "Profile basis contract. baseline is default; zotero is the primary reusable-export workflow. "
-            "zotero_export and live_zotero_db remain accepted compatibility aliases."
+            "Advanced compatibility override for the profile basis. Public choices are baseline, "
+            "zotero_export, and live_zotero_db. If omitted, the app resolves the default from "
+            "default_zotero_db_path, default_zotero_export_path, and the reusable export snapshot. "
+            "Legacy alias zotero remains accepted for compatibility and maps to zotero_export."
         ),
     )
     parser.add_argument(
         "--zotero-db-path",
         type=Path,
         default=argparse.SUPPRESS,
-        help="Optional local Zotero SQLite path used to discover or refresh the reusable export snapshot.",
+        help=(
+            "Advanced override for a live Zotero SQLite path. The normal UI path is to set "
+            "default_zotero_db_path in configs/user_defaults.json."
+        ),
     )
     parser.add_argument(
         "--zotero-collection",
@@ -1159,7 +1394,7 @@ def _resolve_request_window(args: argparse.Namespace) -> tuple[date, date | None
     if end_date is not None and start_date is None:
         start_date = requested_date
     if start_date is not None or end_date is not None:
-        fetch_scope = FETCH_SCOPE_RANGE_FULL if _optional_attr(args, "fetch_scope") is None else str(fetch_scope)
+        fetch_scope = FETCH_SCOPE_RANGE_FULL
     return requested_date, start_date, end_date, str(fetch_scope)
 
 
@@ -1201,6 +1436,49 @@ def _resolve_report_mode(args: argparse.Namespace, loaded_defaults: LoadedUserDe
     )
 
 
+def _resolve_llm_provider(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
+    del loaded_defaults
+    if hasattr(args, "llm_provider"):
+        return ResolvedSetting(value=args.llm_provider, source="cli")
+    env_value = os.environ.get(FRONTIER_COMPASS_LLM_PROVIDER_ENV, "").strip()
+    if env_value:
+        return ResolvedSetting(value=env_value, source="environment")
+    return ResolvedSetting(value=None, source="built-in")
+
+
+def _resolve_llm_base_url(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
+    if hasattr(args, "llm_base_url"):
+        return ResolvedSetting(value=args.llm_base_url, source="cli")
+    if loaded_defaults.defaults.default_llm_base_url is not None:
+        return ResolvedSetting(value=loaded_defaults.defaults.default_llm_base_url, source="config")
+    env_value = os.environ.get(FRONTIER_COMPASS_LLM_BASE_URL_ENV, "").strip()
+    if env_value:
+        return ResolvedSetting(value=env_value, source="environment")
+    return ResolvedSetting(value=None, source="built-in")
+
+
+def _resolve_llm_api_key(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
+    if hasattr(args, "llm_api_key"):
+        return ResolvedSetting(value=args.llm_api_key, source="cli")
+    if loaded_defaults.defaults.default_llm_api_key is not None:
+        return ResolvedSetting(value=loaded_defaults.defaults.default_llm_api_key, source="config")
+    env_value = os.environ.get(FRONTIER_COMPASS_LLM_API_KEY_ENV, "").strip()
+    if env_value:
+        return ResolvedSetting(value=env_value, source="environment")
+    return ResolvedSetting(value=None, source="built-in")
+
+
+def _resolve_llm_model(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
+    if hasattr(args, "llm_model"):
+        return ResolvedSetting(value=args.llm_model, source="cli")
+    if loaded_defaults.defaults.default_llm_model is not None:
+        return ResolvedSetting(value=loaded_defaults.defaults.default_llm_model, source="config")
+    env_value = os.environ.get(FRONTIER_COMPASS_LLM_MODEL_ENV, "").strip()
+    if env_value:
+        return ResolvedSetting(value=env_value, source="environment")
+    return ResolvedSetting(value=None, source="built-in")
+
+
 def _resolve_zotero_export(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
     return resolve_setting(
         cli_value=_optional_attr(args, "zotero_export"),
@@ -1211,10 +1489,14 @@ def _resolve_zotero_export(args: argparse.Namespace, loaded_defaults: LoadedUser
     )
 
 
-def _resolve_zotero_db_path(args: argparse.Namespace) -> ResolvedSetting:
-    if hasattr(args, "zotero_db_path"):
-        return ResolvedSetting(value=_optional_attr(args, "zotero_db_path"), source="cli")
-    return ResolvedSetting(value=None, source="built-in")
+def _resolve_zotero_db_path(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
+    return resolve_setting(
+        cli_value=_optional_attr(args, "zotero_db_path"),
+        cli_provided=hasattr(args, "zotero_db_path"),
+        config_value=loaded_defaults.defaults.default_zotero_db_path,
+        config_is_set=loaded_defaults.defaults.default_zotero_db_path is not None,
+        built_in_value=None,
+    )
 
 
 def _resolve_zotero_collections(args: argparse.Namespace) -> tuple[str, ...]:
@@ -1231,17 +1513,83 @@ def _resolve_zotero_collections(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(selected)
 
 
-def _resolve_profile_source(
+def _resolve_profile_settings(
     args: argparse.Namespace,
+    loaded_defaults: LoadedUserDefaults,
     *,
-    zotero_export_path: str | Path | None,
-    zotero_db_path: str | Path | None,
-) -> ResolvedSetting:
+    zotero_export: ResolvedSetting | None = None,
+    zotero_db: ResolvedSetting | None = None,
+) -> tuple[ResolvedSetting, ResolvedSetting, ResolvedSetting]:
+    explicit_export_path = _optional_attr(args, "zotero_export") if hasattr(args, "zotero_export") else None
+    explicit_db_path = _optional_attr(args, "zotero_db_path") if hasattr(args, "zotero_db_path") else None
+    selection = resolve_default_profile_selection(
+        profile_source=_optional_attr(args, "profile_source") if hasattr(args, "profile_source") else None,
+        explicit_zotero_export_path=explicit_export_path,
+        explicit_zotero_db_path=explicit_db_path,
+        default_zotero_export_path=loaded_defaults.defaults.default_zotero_export_path,
+        default_zotero_db_path=loaded_defaults.defaults.default_zotero_db_path,
+    )
+    resolved_export = zotero_export
+    resolved_db = zotero_db
+    if resolved_export is None:
+        resolved_export = _resolve_zotero_export(args, loaded_defaults)
+    if resolved_db is None:
+        resolved_db = _resolve_zotero_db_path(args, loaded_defaults)
+
     if hasattr(args, "profile_source"):
-        return ResolvedSetting(value=str(args.profile_source), source="cli")
-    if zotero_db_path is not None or zotero_export_path is not None:
-        return ResolvedSetting(value=PROFILE_SOURCE_ZOTERO, source="derived")
-    return ResolvedSetting(value=PROFILE_SOURCE_BASELINE, source="built-in")
+        profile_source = ResolvedSetting(value=selection.profile_source, source="cli")
+    elif explicit_export_path is not None or explicit_db_path is not None:
+        profile_source = ResolvedSetting(value=selection.profile_source, source="derived")
+    elif selection.profile_source == PROFILE_SOURCE_LIVE_ZOTERO_DB and selection.zotero_db_path is not None:
+        profile_source = ResolvedSetting(value=selection.profile_source, source="config")
+    elif selection.profile_source == PROFILE_SOURCE_ZOTERO_EXPORT and selection.zotero_export_path is not None:
+        profile_source_source = (
+            "config"
+            if (
+                loaded_defaults.defaults.default_zotero_export_path is not None
+                and selection.zotero_export_path == loaded_defaults.defaults.default_zotero_export_path
+            )
+            else "derived"
+        )
+        profile_source = ResolvedSetting(value=selection.profile_source, source=profile_source_source)
+    else:
+        profile_source = ResolvedSetting(value=selection.profile_source, source="built-in")
+
+    export_source = "built-in"
+    export_value = None
+    if explicit_export_path is not None:
+        export_source = "cli"
+        export_value = Path(explicit_export_path)
+    elif selection.zotero_export_path is not None:
+        export_value = selection.zotero_export_path
+        if (
+            loaded_defaults.defaults.default_zotero_export_path is not None
+            and selection.zotero_export_path == loaded_defaults.defaults.default_zotero_export_path
+        ):
+            export_source = "config"
+        else:
+            export_source = "derived"
+
+    db_source = "built-in"
+    db_value = None
+    if explicit_db_path is not None:
+        db_source = "cli"
+        db_value = Path(explicit_db_path)
+    elif selection.zotero_db_path is not None:
+        db_value = selection.zotero_db_path
+        if (
+            loaded_defaults.defaults.default_zotero_db_path is not None
+            and selection.zotero_db_path == loaded_defaults.defaults.default_zotero_db_path
+        ):
+            db_source = "config"
+        else:
+            db_source = "derived"
+
+    return (
+        profile_source,
+        ResolvedSetting(value=export_value, source=export_source),
+        ResolvedSetting(value=db_value, source=db_source),
+    )
 
 
 def _resolve_email_to(args: argparse.Namespace, loaded_defaults: LoadedUserDefaults) -> ResolvedSetting:
@@ -1290,6 +1638,9 @@ def _run_daily_settings(
     *,
     selected_source: ResolvedSetting,
     report_mode: ResolvedSetting,
+    llm_provider: ResolvedSetting,
+    llm_base_url: ResolvedSetting,
+    llm_model: ResolvedSetting,
     max_results: ResolvedSetting,
     profile_source: ResolvedSetting,
     zotero_export: ResolvedSetting,
@@ -1311,6 +1662,19 @@ def _run_daily_settings(
         ("Allow stale cache fallback", allow_stale_cache),
         ("Dry-run email", dry_run_email),
     ]
+    if (
+        report_mode.value != DEFAULT_REPORT_MODE
+        or llm_provider.source != "built-in"
+        or llm_base_url.source != "built-in"
+        or llm_model.source != "built-in"
+    ):
+        settings.extend(
+            [
+                ("LLM provider", llm_provider),
+                ("LLM base URL", llm_base_url),
+                ("LLM model", llm_model),
+            ]
+        )
     if dry_run_email.value or email_to.source != "built-in" or email_from.source != "built-in":
         settings.append(("Email to", email_to))
         settings.append(("Email from", email_from))
@@ -1321,6 +1685,9 @@ def _ui_settings(
     *,
     selected_source: ResolvedSetting,
     report_mode: ResolvedSetting,
+    llm_provider: ResolvedSetting,
+    llm_base_url: ResolvedSetting,
+    llm_model: ResolvedSetting,
     max_results: ResolvedSetting,
     profile_source: ResolvedSetting,
     zotero_export: ResolvedSetting,
@@ -1328,7 +1695,7 @@ def _ui_settings(
     fetch_scope: ResolvedSetting,
     allow_stale_cache: ResolvedSetting,
 ) -> tuple[tuple[str, ResolvedSetting], ...]:
-    return (
+    settings = [
         ("Selected source", selected_source),
         ("Report mode", report_mode),
         ("Max results", max_results),
@@ -1337,7 +1704,21 @@ def _ui_settings(
         ("Zotero DB", zotero_db),
         ("Fetch scope", fetch_scope),
         ("Allow stale cache fallback", allow_stale_cache),
-    )
+    ]
+    if (
+        report_mode.value != DEFAULT_REPORT_MODE
+        or llm_provider.source != "built-in"
+        or llm_base_url.source != "built-in"
+        or llm_model.source != "built-in"
+    ):
+        settings.extend(
+            [
+                ("LLM provider", llm_provider),
+                ("LLM base URL", llm_base_url),
+                ("LLM model", llm_model),
+            ]
+        )
+    return tuple(settings)
 
 
 def _optional_attr(args: argparse.Namespace, name: str):
@@ -1367,8 +1748,10 @@ def _print_run_daily_summary(result: DailyRunResult) -> None:
 
 
 def _print_ui_startup_summary(session: LocalUISession) -> None:
-    print(f"Current UI digest: {session.digest.mode_label or session.digest.category}")
-    print("Tracks: Personalized Digest + Frontier Report")
+    print(f"Current UI run: {_format_public_source_setting(session.digest.category)}")
+    print("Tracks: Digest + Frontier Report")
+    if session.digest.category != DEFAULT_REVIEWER_SOURCE:
+        print(f"Advanced source id: {session.digest.category}")
     if session.digest.frontier_report is None:
         print("Frontier Report status: unavailable in this legacy cache.")
     print(f"Frontier Report present: {'yes' if session.digest.frontier_report is not None else 'no'}")
@@ -1378,6 +1761,11 @@ def _print_ui_startup_summary(session: LocalUISession) -> None:
     if session.digest.report_error:
         print(f"Report note: {session.digest.report_error}")
     print(f"Cost mode: {session.digest.cost_mode}")
+    print(f"LLM requested: {format_llm_bool(session.digest.llm_requested)}")
+    print(f"LLM applied: {format_llm_bool(session.digest.llm_applied)}")
+    print(f"LLM provider: {format_llm_provider(session.digest.llm_provider)}")
+    print(f"LLM fallback reason: {session.digest.llm_fallback_reason or 'none'}")
+    print(f"LLM time: {format_llm_seconds(session.digest.llm_seconds)}")
     print(f"Enhanced track: {session.digest.enhanced_track or 'none'}")
     print(f"Runtime note: {session.digest.runtime_note}")
     print(f"Fetch status: {session.fetch_status_label}")
@@ -1441,7 +1829,7 @@ def _print_daily_digest_summary(
         print(f"Artifact source: {artifact_source_label}")
     if fetch_error:
         print(f"Fresh fetch error: {fetch_error}")
-    print("Tracks: Personalized Digest + Frontier Report")
+    print("Tracks: Digest + Frontier Report")
     if digest.frontier_report is None:
         print("Frontier Report status: unavailable in this legacy cache.")
     print(f"Frontier Report present: {'yes' if digest.frontier_report is not None else 'no'}")
@@ -1451,6 +1839,11 @@ def _print_daily_digest_summary(
     if digest.report_error:
         print(f"Report note: {digest.report_error}")
     print(f"Cost mode: {digest.cost_mode}")
+    print(f"LLM requested: {format_llm_bool(digest.llm_requested)}")
+    print(f"LLM applied: {format_llm_bool(digest.llm_applied)}")
+    print(f"LLM provider: {format_llm_provider(digest.llm_provider)}")
+    print(f"LLM fallback reason: {digest.llm_fallback_reason or 'none'}")
+    print(f"LLM time: {format_llm_seconds(digest.llm_seconds)}")
     print(f"Enhanced track: {digest.enhanced_track or 'none'}")
     print(f"Enhanced item count: {digest.enhanced_item_count}")
     print(f"Runtime note: {digest.runtime_note}")
@@ -1477,9 +1870,11 @@ def _print_daily_digest_summary(
             )
         )
     print(f"Display basis: {digest.selection_basis_label}")
-    print(f"Mode: {digest.category}")
-    print(f"Mode label: {digest.mode_label or digest.category}")
-    print(f"Mode kind: {digest.mode_kind or 'n/a'}")
+    print(f"Source run: {_format_public_source_setting(digest.category)}")
+    if digest.category != DEFAULT_REVIEWER_SOURCE:
+        print(f"Advanced source id: {digest.category}")
+        print(f"Advanced source label: {digest.mode_label or digest.category}")
+        print(f"Advanced source kind: {digest.mode_kind or 'n/a'}")
     print(f"Profile basis: {digest.profile.basis_label or 'n/a'}")
     print(f"Profile label: {digest.profile.profile_label}")
     print(f"Profile source: {digest.profile.profile_source} ({digest.profile.profile_source_label})")
@@ -1546,7 +1941,13 @@ def _print_resolution_summary(
 ) -> None:
     print(f"Config: {_format_config_status(loaded_defaults)}")
     for label, resolved in settings:
-        print(f"{label}: {_format_setting_value(resolved.value)} ({resolved.source})")
+        rendered_label = "Source path" if label == "Selected source" else label
+        rendered_value = (
+            _format_public_source_setting(resolved.value)
+            if label == "Selected source"
+            else _format_setting_value(resolved.value)
+        )
+        print(f"{rendered_label}: {rendered_value} ({resolved.source})")
     settings_by_label = {label: resolved for label, resolved in settings}
     profile_source_note = _profile_source_resolution_note(
         profile_source=settings_by_label.get("Profile source"),
@@ -1577,6 +1978,19 @@ def _format_setting_value(value: object) -> str:
     return str(value)
 
 
+def _format_public_source_setting(value: object) -> str:
+    normalized = str(value or "")
+    labels = {
+        SOURCE_BUNDLE_BIOMEDICAL: "default public bundle (arXiv + bioRxiv)",
+        BIOMEDICAL_MULTISOURCE_MODE: "compatibility 3-source run (arXiv + bioRxiv + medRxiv)",
+        BIOMEDICAL_LATEST_MODE: "legacy latest-available biomedical mode",
+        BIOMEDICAL_DISCOVERY_MODE: "advanced biomedical discovery mode",
+        BIOMEDICAL_DAILY_MODE: "advanced q-bio bundle mode",
+        "ai-for-medicine": "advanced AI for medicine bundle override",
+    }
+    return labels.get(normalized, normalized)
+
+
 def _profile_source_resolution_note(
     *,
     profile_source: ResolvedSetting | None,
@@ -1585,15 +1999,10 @@ def _profile_source_resolution_note(
 ) -> str:
     if profile_source is None or profile_source.source != "derived":
         return ""
-    if profile_source.value == PROFILE_SOURCE_ZOTERO:
-        if zotero_db is not None and zotero_db.value is not None and zotero_export is not None and zotero_export.value is not None:
-            return (
-                "Profile source auto-selected: zotero because both a Zotero DB path and "
-                "a reusable Zotero export were supplied."
-            )
-        if zotero_db is not None and zotero_db.value is not None:
-            return "Profile source auto-selected: zotero because a Zotero DB path was supplied."
-        return "Profile source auto-selected: zotero because a Zotero export was supplied."
+    if profile_source.value == PROFILE_SOURCE_LIVE_ZOTERO_DB:
+        return "Profile source auto-selected: live_zotero_db because a Zotero DB path was supplied."
+    if profile_source.value == PROFILE_SOURCE_ZOTERO_EXPORT:
+        return "Profile source auto-selected: zotero_export because a Zotero export was supplied."
     return ""
 
 
