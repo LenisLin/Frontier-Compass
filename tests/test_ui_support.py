@@ -17,6 +17,7 @@ from frontier_compass.storage.schema import (
     PaperRecord,
     RankedPaper,
     RequestWindow,
+    RequestWindowFailure,
     RunTimings,
     SourceRunStats,
 )
@@ -126,7 +127,15 @@ def test_materialize_daily_digest_reuses_same_day_empty_cache_before_stale_fallb
                 displayed_count=0,
                 status="empty",
                 cache_status="fresh",
+                timings=RunTimings(network_seconds=0.4, parse_seconds=0.1, total_seconds=0.5),
             ),
+        ),
+        run_timings=RunTimings(
+            network_seconds=0.4,
+            parse_seconds=0.1,
+            rank_seconds=0.2,
+            report_seconds=0.3,
+            total_seconds=1.0,
         ),
         frontier_report=replace(
             _frontier_report_for(
@@ -142,7 +151,15 @@ def test_materialize_daily_digest_reuses_same_day_empty_cache_before_stale_fallb
                     displayed_count=0,
                     status="empty",
                     cache_status="fresh",
+                    timings=RunTimings(network_seconds=0.4, parse_seconds=0.1, total_seconds=0.5),
                 ),
+            ),
+            run_timings=RunTimings(
+                network_seconds=0.4,
+                parse_seconds=0.1,
+                rank_seconds=0.2,
+                report_seconds=0.3,
+                total_seconds=1.0,
             ),
         ),
         searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
@@ -204,8 +221,14 @@ def test_materialize_daily_digest_reuses_same_day_empty_cache_before_stale_fallb
     assert result.digest.source_run_stats[0].status == "failed"
     assert result.digest.source_run_stats[0].error == "upstream arXiv timeout"
     assert "Same-day cache reused after a fresh fetch failure." in result.digest.source_run_stats[0].note
+    assert result.digest.run_timings.network_seconds == 0.4
+    assert result.digest.run_timings.parse_seconds == 0.1
+    assert result.digest.run_timings.rank_seconds == 0.2
+    assert result.digest.run_timings.report_seconds == 0.3
     assert result.digest.frontier_report is not None
     assert result.digest.frontier_report.source_run_stats[0].cache_status == "same-day-cache"
+    assert result.digest.frontier_report.run_timings.network_seconds == 0.4
+    assert result.digest.frontier_report.run_timings.report_seconds == 0.3
 
 
 def test_stale_cache_fallback_digest_rewrites_current_run_frontier_scope(
@@ -235,7 +258,15 @@ def test_stale_cache_fallback_digest_rewrites_current_run_frontier_scope(
                 displayed_count=1,
                 status="ready",
                 cache_status="fresh",
+                timings=RunTimings(network_seconds=0.6, parse_seconds=0.2, total_seconds=0.8),
             ),
+        ),
+        run_timings=RunTimings(
+            network_seconds=0.6,
+            parse_seconds=0.2,
+            rank_seconds=0.3,
+            report_seconds=0.4,
+            total_seconds=1.5,
         ),
         frontier_report=replace(
             _frontier_report_for(
@@ -251,7 +282,15 @@ def test_stale_cache_fallback_digest_rewrites_current_run_frontier_scope(
                     displayed_count=1,
                     status="ready",
                     cache_status="fresh",
+                    timings=RunTimings(network_seconds=0.6, parse_seconds=0.2, total_seconds=0.8),
                 ),
+            ),
+            run_timings=RunTimings(
+                network_seconds=0.6,
+                parse_seconds=0.2,
+                rank_seconds=0.3,
+                report_seconds=0.4,
+                total_seconds=1.5,
             ),
         ),
         searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
@@ -290,10 +329,16 @@ def test_stale_cache_fallback_digest_rewrites_current_run_frontier_scope(
     assert result.digest.source_run_stats[0].cache_status == "stale-compatible-cache"
     assert result.digest.source_run_stats[0].error == "upstream arXiv timeout"
     assert "Older compatible cache reused after a fresh fetch failure." in result.digest.source_run_stats[0].note
+    assert result.digest.run_timings.network_seconds == 0.6
+    assert result.digest.run_timings.parse_seconds == 0.2
+    assert result.digest.run_timings.rank_seconds == 0.3
+    assert result.digest.run_timings.report_seconds == 0.4
     assert result.digest.frontier_report is not None
     assert result.digest.frontier_report.requested_date == requested_date
     assert result.digest.frontier_report.effective_date == cached_effective_date
     assert result.digest.frontier_report.source_run_stats[0].cache_status == "stale-compatible-cache"
+    assert result.digest.frontier_report.run_timings.network_seconds == 0.6
+    assert result.digest.frontier_report.run_timings.report_seconds == 0.4
 
 
 def test_load_or_materialize_current_digest_discovers_nested_stale_cache(
@@ -435,6 +480,11 @@ def test_ui_helpers_build_summary_and_cards() -> None:
     assert summary.cost_mode == "zero-token"
     assert summary.enhanced_track == ""
     assert summary.enhanced_item_count == 0
+    assert summary.llm_requested is False
+    assert summary.llm_applied is False
+    assert summary.llm_provider is None
+    assert summary.llm_fallback_reason is None
+    assert summary.llm_seconds is None
     assert summary.ranked_count == 1
     assert summary.total_fetched == 2
     assert summary.strict_same_day_fetched == 2
@@ -453,9 +503,11 @@ def test_ui_helpers_build_summary_and_cards() -> None:
     assert cards[0].score == 0.8123
     assert cards[0].status_label == "Priority review"
     assert cards[0].is_recommended is True
-    assert cards[0].why_label == "Why it surfaced"
-    assert "baseline:" in cards[0].why_it_surfaced
-    assert "category: q-bio, q-bio.gn" in cards[0].why_it_surfaced
+    assert cards[0].why_label == "Why this paper"
+    assert "matched biomedical signals:" in cards[0].why_it_surfaced
+    assert "held category support:" in cards[0].why_it_surfaced
+    assert cards[0].score_explanation == "Score stays modest because the current ranking signals are light."
+    assert "category fit: q-bio, q-bio.gn" in cards[0].relevance_explanation
     assert cards[0].zotero_effect_label == "Zotero: inactive"
     assert cards[0].score_breakdown[0] == ("Biomedical baseline", 0.0)
     assert any(line.startswith("Category matches: q-bio, q-bio.gn") for line in cards[0].score_detail_lines)
@@ -1412,12 +1464,13 @@ def test_load_or_materialize_current_digest_materializes_report_for_cached_diges
     assert result.report_path == report_path
     assert report_path.exists()
     html = report_path.read_text(encoding="utf-8")
-    assert "Personalized Digest" in html
-    assert "Frontier Report" in html
+    assert "Daily Full Report" in html
+    assert "Most Relevant to Your Zotero" in html
     assert "Top recommendations" in html
     assert "Audit trail" in html
-    assert html.index("What to read first") < html.index("Frontier runtime")
-    assert "<strong>Source mix</strong>\n        <p></p>" not in html
+    assert "Open source paper" in html
+    assert html.index("Daily Full Report") < html.index("Most Relevant to Your Zotero")
+    assert "<strong>Source composition</strong>\n        <p></p>" not in html
 
 
 def test_load_or_materialize_current_digest_fetches_when_same_day_cache_absent(monkeypatch, tmp_path: Path) -> None:
@@ -1559,22 +1612,14 @@ def test_load_or_materialize_current_digest_reuses_same_day_range_cache_without_
 ) -> None:
     app = FrontierCompassApp()
     requested_date = date(2026, 3, 24)
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-24.html"
+    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
     digest = _range_digest_fixture(
         source="arxiv",
         category=BIOMEDICAL_LATEST_MODE,
         requested_date=requested_date,
         start_date=requested_date,
         end_date=requested_date,
-        request_window=RequestWindow(
-            kind="range",
-            requested_date=requested_date,
-            start_date=requested_date,
-            end_date=requested_date,
-            status="complete",
-            completed_dates=(requested_date,),
-        ),
         ranked=[
             _sample_ranked_paper(score=0.96, identifier="2603.24001v1"),
             _sample_ranked_paper(score=0.91, identifier="2603.24002v1"),
@@ -1616,9 +1661,7 @@ def test_load_or_materialize_current_digest_reuses_same_day_range_cache_without_
     assert result.display_source == "loaded from cache"
     assert result.cache_path == cache_path
     assert result.report_path == report_path
-    assert result.digest.request_window.kind == "range"
-    assert result.digest.request_window.completed_dates == (requested_date,)
-    assert result.digest.request_window.status == "complete"
+    assert result.digest.request_window.kind == "day"
     assert len(result.digest.ranked) == 3
     assert result.digest.frontier_report is not None
     assert result.digest.frontier_report.total_ranked == 3
@@ -1711,6 +1754,9 @@ def test_build_range_digest_preserves_partial_window_provenance_and_marks_report
     assert result.request_window.failed_date == end_date
     assert result.request_window.failed_source == "arxiv"
     assert result.request_window.failure_reason == "upstream arXiv timeout"
+    assert result.request_window.failure_entries == (
+        RequestWindowFailure(date=end_date, source="arxiv", reason="upstream arXiv timeout"),
+    )
     assert len(result.ranked) == 4
     assert result.frontier_report is not None
     assert result.frontier_report.report_status == "partial"
@@ -1724,7 +1770,100 @@ def test_build_range_digest_preserves_partial_window_provenance_and_marks_report
     assert reloaded.request_window.failed_date == end_date
     assert reloaded.request_window.failed_source == "arxiv"
     assert reloaded.request_window.failure_reason == "upstream arXiv timeout"
+    assert reloaded.request_window.failure_entries == (
+        RequestWindowFailure(date=end_date, source="arxiv", reason="upstream arXiv timeout"),
+    )
     assert reloaded.report_status == "partial"
+
+
+def test_build_range_digest_continues_after_hard_failure_and_serializes_failed_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FrontierCompassApp()
+    start_date = date(2026, 3, 24)
+    failed_date = date(2026, 3, 25)
+    end_date = date(2026, 3, 26)
+    first_child = _range_digest_fixture(
+        source="arxiv",
+        category=BIOMEDICAL_LATEST_MODE,
+        requested_date=start_date,
+        start_date=start_date,
+        end_date=start_date,
+        ranked=[_sample_ranked_paper(score=0.95, identifier="2603.24101v1")],
+        source_run_stats=(
+            SourceRunStats(
+                source="arxiv",
+                fetched_count=1,
+                displayed_count=1,
+                status="ready",
+                cache_status="fresh",
+                timings=RunTimings(network_seconds=0.4, parse_seconds=0.1, total_seconds=0.5),
+            ),
+        ),
+        report_status="ready",
+        source_counts={"arxiv": 1},
+    )
+    third_child = _range_digest_fixture(
+        source="arxiv",
+        category=BIOMEDICAL_LATEST_MODE,
+        requested_date=end_date,
+        start_date=end_date,
+        end_date=end_date,
+        ranked=[_sample_ranked_paper(score=0.88, identifier="2603.24103v1")],
+        source_run_stats=(
+            SourceRunStats(
+                source="arxiv",
+                fetched_count=1,
+                displayed_count=1,
+                status="ready",
+                cache_status="fresh",
+                timings=RunTimings(network_seconds=0.3, parse_seconds=0.1, total_seconds=0.4),
+            ),
+        ),
+        report_status="ready",
+        source_counts={"arxiv": 1},
+    )
+
+    def fake_build_daily_digest(**kwargs):  # type: ignore[no-untyped-def]
+        requested_day = kwargs["today"]
+        if requested_day == failed_date:
+            raise RuntimeError("upstream arXiv timeout on 2026-03-25")
+        return {
+            start_date: first_child,
+            end_date: third_child,
+        }[requested_day]
+
+    monkeypatch.setattr(app, "build_daily_digest", fake_build_daily_digest)
+
+    result = app._build_range_digest(
+        category=BIOMEDICAL_LATEST_MODE,
+        mode=None,
+        report_mode="deterministic",
+        start_date=start_date,
+        end_date=end_date,
+        max_results=1,
+        feed_url=None,
+        profile_source="baseline",
+        zotero_export_path=None,
+        zotero_db_path=None,
+    )
+
+    assert result.report_status == "partial"
+    assert result.request_window.completed_dates == (start_date, end_date)
+    assert result.request_window.failed_date == failed_date
+    assert result.request_window.failed_source == "arxiv"
+    assert result.request_window.failure_reason == "upstream arXiv timeout on 2026-03-25"
+    assert result.request_window.failure_entries == (
+        RequestWindowFailure(
+            date=failed_date,
+            source="arxiv",
+            reason="upstream arXiv timeout on 2026-03-25",
+        ),
+    )
+    assert len(result.ranked) == 2
+    assert result.frontier_report is not None
+    assert result.frontier_report.report_status == "partial"
+    assert "failed 2026-03-25 / arxiv" in result.request_window.label
 
 
 def test_build_range_digest_keeps_failed_source_blank_when_first_partial_child_is_ambiguous(
@@ -1816,7 +1955,10 @@ def test_build_range_digest_keeps_failed_source_blank_when_first_partial_child_i
     }
 
     def fake_build_daily_digest(**kwargs):  # type: ignore[no-untyped-def]
-        return child_by_date[kwargs["today"]]
+        requested_day = kwargs["today"]
+        if requested_day not in child_by_date:
+            raise RuntimeError("upstream multisource timeout")
+        return child_by_date[requested_day]
 
     monkeypatch.setattr(app, "build_daily_digest", fake_build_daily_digest)
 
@@ -1836,7 +1978,25 @@ def test_build_range_digest_keeps_failed_source_blank_when_first_partial_child_i
     assert result.request_window.failed_date == start_date
     assert result.request_window.failed_source == ""
     assert result.request_window.failure_reason.startswith("biorxiv unavailable")
-    assert " / medrxiv" not in result.request_window.label
+    assert "upstream multisource timeout" in result.request_window.failure_reason
+    assert result.request_window.failure_entries == (
+        RequestWindowFailure(
+            date=start_date,
+            source="",
+            reason="biorxiv unavailable; medrxiv unavailable",
+        ),
+        RequestWindowFailure(
+            date=date(2026, 3, 25),
+            source="",
+            reason="upstream multisource timeout",
+        ),
+        RequestWindowFailure(
+            date=end_date,
+            source="medrxiv",
+            reason="medrxiv unavailable",
+        ),
+    )
+    assert "failed 2026-03-25 (upstream multisource timeout)" in result.request_window.label
     assert result.report_status == "partial"
 
 
@@ -1956,6 +2116,10 @@ def test_build_range_digest_keeps_multisource_zero_count_and_failed_source_rows_
     assert result.request_window.failed_source == "medrxiv"
     assert result.request_window.failed_date == start_date
     assert result.request_window.failure_reason == "medRxiv unavailable"
+    assert result.request_window.failure_entries == (
+        RequestWindowFailure(date=start_date, source="medrxiv", reason="medRxiv unavailable"),
+        RequestWindowFailure(date=end_date, source="medrxiv", reason="medRxiv unavailable"),
+    )
     source_stats = {row.source: row for row in result.source_run_stats}
     assert tuple(source_stats) == ("arxiv", "biorxiv", "medrxiv")
     assert source_stats["biorxiv"].displayed_count == 0
@@ -2256,7 +2420,9 @@ def test_html_report_builder_renders_discovery_metadata() -> None:
     assert "Latest-available display fallback" in html
     assert "Stale cache fallback" in html
     assert "Showing strict same-day results for the requested date." in html
-    assert "Why it surfaced" in html
+    assert "Why this paper" in html
+    assert "Score explanation" in html
+    assert "Relevant to your interests" in html
     assert "Score details" in html
     assert "broader-biomedical-discovery-v1" in html
     assert "Hybrid q-bio bundle plus fixed broader arXiv API discovery queries." in html
@@ -2326,6 +2492,7 @@ def test_html_report_builder_renders_source_contract_and_source_identifier() -> 
         source_metadata={
             "biorxiv": {
                 "mode": "rss",
+                "contract_mode": "rss",
                 "native_filters": ["all"],
                 "native_endpoints": {"all": "https://connect.biorxiv.org/biorxiv_xml.php?subject=all"},
             }
@@ -2337,7 +2504,7 @@ def test_html_report_builder_renders_source_contract_and_source_identifier() -> 
     html = HtmlReportBuilder().render_daily_digest(digest)
 
     assert "Source contract" in html
-    assert "bioRxiv: mode=rss | filters=all | endpoints=1" in html
+    assert "bioRxiv: mode=rss | contract=rss | filters=all | endpoints=1" in html
     assert "10.1101/2026.03.24.000001v1" in html
     assert "bioRxiv (1)" in html
 
@@ -2485,7 +2652,7 @@ def test_html_report_builder_handles_legacy_cache_without_frontier_report_honest
 
     html = HtmlReportBuilder().render_daily_digest(digest, acquisition_status_label="same-day cache")
 
-    assert "Frontier report unavailable" in html
+    assert "Field-wide report unavailable" in html
     assert "will not infer one from the personalized slice" in html
 
 
@@ -2557,16 +2724,19 @@ def test_html_report_builder_balances_reviewer_shortlist_and_keeps_full_ranked_o
     )
 
     html = HtmlReportBuilder().render_daily_digest(digest)
-    shortlist_section = html.split('<section class="section"><h2>Audit trail</h2>', 1)[0]
+    personalized_section = html.split('<section class="section">\n      <h2>Most Relevant to Your Zotero</h2>', 1)[1]
+    personalized_section = personalized_section.split('<section class="section">\n      <h2>Audit trail</h2>', 1)[0]
 
-    assert "Personalized Digest" in html
-    assert "Frontier Report" in html
+    assert "Daily Full Report" in html
+    assert "Most Relevant to Your Zotero" in html
     assert "Top recommendations" in html
-    assert "Repeated themes" in html
-    assert "Theme: genomics / transcriptomics / single-cell" in html
-    assert "Theme: pathology / histopathology / microscopy" in html
-    assert shortlist_section.index("Single-cell Transcriptomics Atlas Integration") < shortlist_section.index("Zero-shot Chest Scan Segmentation")
-    assert shortlist_section.index("Whole-slide Histopathology Reasoning") < shortlist_section.index("Zero-shot Chest Scan Segmentation")
+    assert "Open source paper" in html
+    assert "Repeated themes / hotspots" in html
+    assert "genomics / transcriptomics / single-cell" in html
+    assert "pathology / histopathology / microscopy" in html
+    assert html.index("Daily Full Report") < html.index("Most Relevant to Your Zotero")
+    assert personalized_section.index("Single-cell Transcriptomics Atlas Integration") < personalized_section.index("Zero-shot Chest Scan Segmentation")
+    assert personalized_section.index("Whole-slide Histopathology Reasoning") < personalized_section.index("Zero-shot Chest Scan Segmentation")
     assert "All ranked papers" not in html
 
 
@@ -2616,7 +2786,7 @@ def test_html_report_builder_renders_exploration_section_when_present() -> None:
 
     html = HtmlReportBuilder().render_daily_digest(digest)
 
-    assert "Exploration" in html
+    assert "Exploration lane" in html
     assert "Why it&#x27;s exploratory" in html
     assert "These use the same biomedical baseline profile" in html
     assert "Exploration lane microscopy fixture" in html

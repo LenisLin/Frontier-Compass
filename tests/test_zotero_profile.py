@@ -137,48 +137,48 @@ def test_resolve_daily_profile_explicit_baseline_does_not_use_available_zotero_p
     assert resolved.keywords == baseline.keywords
 
 
-def test_resolve_daily_profile_live_zotero_alias_builds_export_backed_profile(tmp_path: Path) -> None:
+def test_resolve_daily_profile_explicit_zotero_export_builds_export_backed_profile(tmp_path: Path) -> None:
     app = _app_with_local_paths(tmp_path)
     db_path = tmp_path / "zotero.sqlite"
     _write_minimal_zotero_db(db_path)
 
     resolved = app._resolve_daily_profile(
         BIOMEDICAL_LATEST_MODE,
-        profile_source="live_zotero_db",
+        profile_source="zotero_export",
         zotero_db_path=db_path,
     )
 
     export_path = tmp_path / "data" / "raw" / "zotero" / "library.csl.json"
     assert export_path.exists()
-    assert resolved.profile_source == "zotero"
-    assert resolved.basis_label == "biomedical baseline + Zotero"
+    assert resolved.profile_source == "zotero_export"
+    assert resolved.basis_label == "biomedical baseline + Zotero export"
     assert resolved.zotero_export_name == export_path.name
+    assert resolved.zotero_db_name == ""
     assert resolved.profile_basis is not None
     assert resolved.profile_basis.path == str(export_path.resolve())
     assert resolved.profile_basis.item_count == 1
     assert resolved.profile_basis.used_item_count == 1
     assert resolved.zotero_used_item_count == 1
-    assert "Locally exported Zotero profile snapshot." == resolved.profile_basis.description
+    assert "Read-only CSL JSON Zotero profile source." == resolved.profile_basis.description
 
 
-def test_resolve_daily_profile_reuses_existing_export_when_explicit_db_path_is_unreadable(tmp_path: Path) -> None:
+def test_resolve_daily_profile_derived_live_zotero_db_from_db_path(tmp_path: Path) -> None:
     app = _app_with_local_paths(tmp_path)
     db_path = tmp_path / "zotero.sqlite"
     _write_minimal_zotero_db(db_path)
 
-    app.zotero_library_state(refresh=True, db_path=db_path)
-
-    missing_db_path = tmp_path / "missing.sqlite"
     resolved = app._resolve_daily_profile(
         BIOMEDICAL_LATEST_MODE,
-        zotero_export_path=app.zotero_export_path,
-        zotero_db_path=missing_db_path,
+        zotero_db_path=db_path,
     )
 
-    assert resolved.profile_source == "zotero"
+    assert resolved.profile_source == "live_zotero_db"
+    assert resolved.basis_label == "biomedical baseline + live Zotero DB"
     assert resolved.profile_basis is not None
-    assert resolved.profile_basis.path == str(app.zotero_export_path.resolve())
-    assert resolved.zotero_export_name == app.zotero_export_path.name
+    assert resolved.profile_basis.path == str(db_path.resolve())
+    assert resolved.zotero_db_name == db_path.name
+    assert resolved.zotero_export_name == ""
+    assert app.zotero_export_path.exists() is False
 
 
 def test_resolve_daily_profile_filters_export_by_selected_collections(tmp_path: Path) -> None:
@@ -188,34 +188,66 @@ def test_resolve_daily_profile_filters_export_by_selected_collections(tmp_path: 
 
     resolved = app._resolve_daily_profile(
         BIOMEDICAL_LATEST_MODE,
-        profile_source="zotero",
+        profile_source="zotero_export",
         zotero_db_path=db_path,
         zotero_collections=("Tumor microenvironment",),
     )
 
-    assert resolved.profile_source == "zotero"
+    assert resolved.profile_source == "zotero_export"
     assert resolved.zotero_selected_collections == ("Tumor microenvironment",)
     assert resolved.profile_basis is not None
     assert resolved.profile_basis.used_item_count == 1
     assert "Selected collections: Tumor microenvironment." in resolved.notes
 
 
-def test_resolve_daily_profile_live_db_alias_reuses_existing_export_without_db_path(tmp_path: Path) -> None:
+def test_resolve_daily_profile_legacy_zotero_alias_maps_to_export_contract(tmp_path: Path) -> None:
     app = _app_with_local_paths(tmp_path)
     db_path = tmp_path / "zotero.sqlite"
     _write_minimal_zotero_db(db_path)
-    app.zotero_library_state(refresh=True, db_path=db_path)
 
     resolved = app._resolve_daily_profile(
         BIOMEDICAL_LATEST_MODE,
-        profile_source="live_zotero_db",
-        zotero_export_path=app.zotero_export_path,
+        profile_source="zotero",
+        zotero_db_path=db_path,
     )
 
-    assert resolved.profile_source == "zotero"
+    assert resolved.profile_source == "zotero_export"
+    assert resolved.basis_label == "biomedical baseline + Zotero export"
     assert resolved.zotero_export_name == app.zotero_export_path.name
     assert resolved.profile_basis is not None
     assert resolved.profile_basis.path == str(app.zotero_export_path.resolve())
+
+
+def test_resolve_daily_profile_explicit_live_zotero_db_does_not_fallback_to_existing_export(tmp_path: Path) -> None:
+    app = _app_with_local_paths(tmp_path)
+    healthy_db_path = tmp_path / "zotero.sqlite"
+    _write_minimal_zotero_db(healthy_db_path)
+    app.zotero_library_state(refresh=True, db_path=healthy_db_path)
+
+    missing_db_path = tmp_path / "missing.sqlite"
+
+    with pytest.raises(ValueError, match="Zotero database not found|Unable to read Zotero database"):
+        app._resolve_daily_profile(
+            BIOMEDICAL_LATEST_MODE,
+            profile_source="live_zotero_db",
+            zotero_export_path=app.zotero_export_path,
+            zotero_db_path=missing_db_path,
+        )
+
+
+def test_resolve_daily_profile_rejects_ambiguous_derived_zotero_inputs(tmp_path: Path) -> None:
+    app = _app_with_local_paths(tmp_path)
+    db_path = tmp_path / "zotero.sqlite"
+    export_path = tmp_path / "custom-library.csl.json"
+    _write_minimal_zotero_db(db_path)
+    export_path.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Both a Zotero export path and a Zotero DB path were supplied"):
+        app._resolve_daily_profile(
+            BIOMEDICAL_LATEST_MODE,
+            zotero_export_path=export_path,
+            zotero_db_path=db_path,
+        )
 
 
 def test_resolve_daily_profile_rejects_unknown_profile_source() -> None:

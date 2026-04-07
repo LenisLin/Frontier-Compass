@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from html import unescape
 from pathlib import Path
@@ -11,6 +12,7 @@ from frontier_compass.common.frontier_report import (
     PATHOLOGY_THEME,
     build_daily_frontier_report,
 )
+from frontier_compass.common.report_mode import build_report_runtime_contract
 from frontier_compass.reporting.daily_brief import build_reviewer_shortlist
 from frontier_compass.reporting.html_report import HtmlReportBuilder
 from frontier_compass.storage.schema import (
@@ -82,7 +84,10 @@ def test_build_daily_frontier_report_summarizes_full_pool() -> None:
     assert report.repeated_themes[0].count == 2
     assert any(signal.label == "medical imaging / radiology" for signal in report.salient_topics)
     assert report.field_highlights
-    assert report.takeaways[0].startswith("Frontier view covers 4 ranked papers")
+    assert report.takeaways[0].startswith("Frontier Report covers 4 ranked papers")
+    assert report.takeaways[1].startswith("Source composition in this broader pool")
+    assert report.takeaways[3].startswith("Method hotspots today")
+    assert report.takeaways[4].startswith('Important highlight: "')
 
 
 def test_frontier_report_field_highlights_are_broader_than_personalized_shortlist() -> None:
@@ -357,6 +362,135 @@ def test_html_report_embeds_machine_readable_run_summary() -> None:
     assert payload["source_run_stats"][1]["cache_status"] == "same-day-cache"
     assert payload["run_timings"]["report_seconds"] == 0.4
     assert payload["run_timings"]["total_seconds"] == 1.7
+
+
+def test_html_daily_digest_renders_source_provenance_table_and_llm_fields() -> None:
+    ranked = [
+        _ranked_paper(
+            identifier="2603.35002v1",
+            title="HTML provenance fixture",
+            summary="HTML provenance fixture.",
+            categories=("q-bio.GN",),
+            score=0.84,
+        )
+    ]
+    runtime = build_report_runtime_contract("enhanced")
+    source_run_stats = (
+        SourceRunStats(
+            source="arxiv",
+            fetched_count=0,
+            displayed_count=0,
+            status="empty",
+            cache_status="fresh",
+        ),
+        SourceRunStats(
+            source="biorxiv",
+            fetched_count=0,
+            displayed_count=0,
+            status="failed",
+            cache_status="same-day-cache",
+            live_outcome="live-failed",
+            error="bioRxiv timeout",
+        ),
+        SourceRunStats(
+            source="medrxiv",
+            fetched_count=1,
+            displayed_count=1,
+            status="ready",
+            cache_status="stale-compatible-cache",
+            live_outcome="live-success",
+            note="Older compatible cache reused after a fresh fetch failure.",
+        ),
+    )
+    frontier_report = replace(
+        build_daily_frontier_report(
+            paper_pool=[item.paper for item in ranked],
+            ranked_papers=ranked,
+            requested_date=date(2026, 3, 24),
+            effective_date=date(2026, 3, 24),
+            source="multisource",
+            mode=BIOMEDICAL_LATEST_MODE,
+            mode_label="Biomedical latest available",
+            total_fetched=1,
+            **runtime,
+        ),
+        source_run_stats=source_run_stats,
+        source_counts={"arxiv": 0, "biorxiv": 0, "medrxiv": 1},
+    )
+    digest = DailyDigest(
+        source="multisource",
+        category=BIOMEDICAL_LATEST_MODE,
+        target_date=date(2026, 3, 24),
+        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
+        feed_url="https://export.arxiv.org/api/query",
+        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        ranked=ranked,
+        frontier_report=frontier_report,
+        source_run_stats=source_run_stats,
+        source_counts={"arxiv": 0, "biorxiv": 0, "medrxiv": 1},
+        total_fetched=1,
+        **runtime,
+    )
+
+    html = HtmlReportBuilder().render_daily_digest(digest, acquisition_status_label="fresh source fetch")
+
+    assert "Digest source provenance" in html
+    assert "Frontier source provenance" in html
+    assert "<th>Outcome</th>" in html
+    assert "live-zero" in html
+    assert "live-failed" in html
+    assert "same-day-cache" in html
+    assert "stale-cache" in html
+    assert "Older compatible cache reused after a fresh fetch failure." in html
+    assert "LLM runtime" in html
+    assert "LLM requested" in html
+    assert "LLM applied" in html
+    assert "LLM provider" in html
+    assert "LLM fallback reason" in html
+    assert "No model-assisted provider is configured for this run." in html
+
+
+def test_html_frontier_report_keeps_field_language_distinct_from_digest() -> None:
+    ranked = [
+        _ranked_paper(
+            identifier="2603.36001v1",
+            title="Field hotspot fixture",
+            summary="Medical imaging hotspot fixture for the frontier report.",
+            categories=("cs.CV",),
+            score=0.83,
+        )
+    ]
+    digest = DailyDigest(
+        source="arxiv",
+        category=BIOMEDICAL_LATEST_MODE,
+        target_date=date(2026, 3, 24),
+        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
+        feed_url="https://export.arxiv.org/api/query",
+        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        ranked=ranked,
+        frontier_report=build_daily_frontier_report(
+            paper_pool=[item.paper for item in ranked],
+            ranked_papers=ranked,
+            requested_date=date(2026, 3, 24),
+            effective_date=date(2026, 3, 24),
+            source="arxiv",
+            mode=BIOMEDICAL_LATEST_MODE,
+            mode_label="Biomedical latest available",
+            total_fetched=1,
+        ),
+        searched_categories=("q-bio", "cs.CV"),
+        per_category_counts={"q-bio": 1, "cs.CV": 1},
+        total_fetched=1,
+    )
+
+    html = HtmlReportBuilder().render_daily_digest(digest)
+
+    assert "Digest shortlist" in html
+    assert "Frontier Report" in html
+    assert "Method hotspots" in html
+    assert "Notable highlights" in html
+    assert "Why this paper" in html
+    assert "Why highlighted" in html
 
 
 def _ranked_paper(

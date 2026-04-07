@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -29,6 +30,11 @@ def test_report_runtime_contract_defaults_to_deterministic_zero_token() -> None:
             "Zero-token run: fetching, ranking, recommendation summaries, exploration picks, and the current "
             "Frontier Report all use deterministic local logic only."
         ),
+        "llm_requested": False,
+        "llm_applied": False,
+        "llm_provider": None,
+        "llm_fallback_reason": None,
+        "llm_seconds": None,
     }
 
 
@@ -40,7 +46,25 @@ def test_enhanced_report_mode_is_explicit_but_stays_zero_token_without_model() -
     assert runtime["cost_mode"] == "zero-token"
     assert runtime["enhanced_track"] == ""
     assert runtime["enhanced_item_count"] == 0
+    assert runtime["llm_requested"] is True
+    assert runtime["llm_applied"] is False
+    assert runtime["llm_provider"] is None
+    assert runtime["llm_fallback_reason"] == "No model-assisted provider is configured for this run."
+    assert runtime["llm_seconds"] is None
     assert "stayed deterministic and zero-token" in str(runtime["runtime_note"])
+
+
+def test_enhanced_report_mode_preserves_configured_provider_in_llm_provenance() -> None:
+    runtime = build_report_runtime_contract(ENHANCED_REPORT_MODE, llm_provider="openai")
+
+    assert runtime["requested_report_mode"] == "enhanced"
+    assert runtime["report_mode"] == "deterministic"
+    assert runtime["cost_mode"] == "zero-token"
+    assert runtime["llm_requested"] is True
+    assert runtime["llm_applied"] is False
+    assert runtime["llm_provider"] == "openai"
+    assert runtime["llm_fallback_reason"] == "A model-assisted provider is configured, but the Frontier Report run stayed deterministic."
+    assert runtime["llm_seconds"] is None
 
 
 def test_cli_report_mode_resolution_prefers_cli_then_config(tmp_path: Path) -> None:
@@ -105,10 +129,18 @@ def test_daily_digest_serialization_preserves_report_runtime_fields() -> None:
     assert restored.requested_report_mode == "enhanced"
     assert restored.report_mode == "deterministic"
     assert restored.cost_mode == ZERO_TOKEN_COST_MODE
+    assert restored.llm_requested is True
+    assert restored.llm_applied is False
+    assert restored.llm_provider is None
+    assert restored.llm_fallback_reason == "No model-assisted provider is configured for this run."
     assert restored.enhanced_item_count == 0
     assert restored.frontier_report is not None
     assert restored.frontier_report.requested_report_mode == "enhanced"
     assert restored.frontier_report.report_mode == "deterministic"
+    assert restored.frontier_report.llm_requested is True
+    assert restored.frontier_report.llm_applied is False
+    assert restored.frontier_report.deterministic_takeaways == restored.frontier_report.takeaways
+    assert restored.frontier_report.deterministic_field_highlights == restored.frontier_report.field_highlights
 
 
 def test_daily_run_summary_does_not_mark_default_runs_model_assisted() -> None:
@@ -130,6 +162,11 @@ def test_daily_run_summary_does_not_mark_default_runs_model_assisted() -> None:
     assert summary.requested_report_mode == "deterministic"
     assert summary.report_mode == "deterministic"
     assert summary.cost_mode == "zero-token"
+    assert summary.llm_requested is False
+    assert summary.llm_applied is False
+    assert summary.llm_provider is None
+    assert summary.llm_fallback_reason is None
+    assert summary.llm_seconds is None
     assert summary.zero_token is True
     assert summary.model_assisted is False
 
@@ -180,9 +217,145 @@ def test_load_daily_digest_backfills_runtime_contract_into_legacy_cache(tmp_path
     assert loaded.report_mode == "deterministic"
     assert loaded.cost_mode == "zero-token"
     assert loaded.runtime_note
+    assert loaded.llm_requested is False
+    assert loaded.llm_applied is False
+    assert loaded.llm_provider is None
+    assert loaded.llm_fallback_reason is None
     assert rewritten["report_mode"] == "deterministic"
     assert rewritten["cost_mode"] == "zero-token"
     assert rewritten["runtime_note"] == loaded.runtime_note
+
+
+def test_digest_for_report_mode_applies_model_assisted_frontier_report(monkeypatch) -> None:
+    app = FrontierCompassApp()
+    monkeypatch.setenv("FRONTIER_COMPASS_LLM_BASE_URL", "https://example.invalid/v1")
+    monkeypatch.setenv("FRONTIER_COMPASS_LLM_API_KEY", "secret-token")
+    monkeypatch.setenv("FRONTIER_COMPASS_LLM_MODEL", "gpt-5-mini")
+    ranked = [_ranked_paper()]
+    digest = DailyDigest(
+        source="arxiv",
+        category=BIOMEDICAL_LATEST_MODE,
+        target_date=date(2026, 3, 24),
+        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
+        feed_url="https://export.arxiv.org/api/query",
+        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        ranked=ranked,
+        frontier_report=build_daily_frontier_report(
+            paper_pool=[item.paper for item in ranked],
+            ranked_papers=ranked,
+            requested_date=date(2026, 3, 24),
+            effective_date=date(2026, 3, 24),
+            source="arxiv",
+            mode=BIOMEDICAL_LATEST_MODE,
+            mode_label="Biomedical latest available",
+            total_fetched=1,
+        ),
+        searched_categories=("q-bio",),
+        per_category_counts={"q-bio": 1},
+        total_fetched=1,
+    )
+
+    def fake_build_model_assisted_frontier_report(frontier_report, *, settings):  # type: ignore[no-untyped-def]
+        assert settings.provider_label == "openai-compatible"
+        return type(
+            "LLMResult",
+            (),
+            {
+                "report": replace(
+                    frontier_report,
+                    takeaways=("Model-assisted takeaway.",),
+                    field_highlights=tuple(
+                        replace(item, why="Model-assisted rationale.")
+                        for item in frontier_report.field_highlights
+                    ),
+                ),
+                "enhanced_item_count": 3,
+            },
+        )()
+
+    monkeypatch.setattr(
+        "frontier_compass.ui.app.build_model_assisted_frontier_report",
+        fake_build_model_assisted_frontier_report,
+    )
+
+    updated = app._digest_for_report_mode(
+        digest,
+        report_mode=ENHANCED_REPORT_MODE,
+    )
+
+    assert updated.report_mode == "enhanced"
+    assert updated.cost_mode == "model-assisted"
+    assert updated.llm_applied is True
+    assert updated.llm_provider == "openai-compatible"
+    assert updated.enhanced_item_count == 3
+    assert updated.frontier_report is not None
+    assert updated.frontier_report.takeaways == ("Model-assisted takeaway.",)
+    assert updated.frontier_report.field_highlights[0].why == "Model-assisted rationale."
+
+
+def test_digest_for_report_mode_restores_deterministic_frontier_report_when_enhanced_is_unavailable() -> None:
+    app = FrontierCompassApp()
+    ranked = [_ranked_paper()]
+    frontier_report = build_daily_frontier_report(
+        paper_pool=[item.paper for item in ranked],
+        ranked_papers=ranked,
+        requested_date=date(2026, 3, 24),
+        effective_date=date(2026, 3, 24),
+        source="arxiv",
+        mode=BIOMEDICAL_LATEST_MODE,
+        mode_label="Biomedical latest available",
+        total_fetched=1,
+    )
+    mutated_report = replace(
+        frontier_report,
+        requested_report_mode="enhanced",
+        report_mode="enhanced",
+        cost_mode="model-assisted",
+        enhanced_track="frontier-report",
+        enhanced_item_count=2,
+        runtime_note="Enhanced.",
+        llm_requested=True,
+        llm_applied=True,
+        llm_provider="openai-compatible",
+        llm_fallback_reason=None,
+        llm_seconds=1.0,
+        takeaways=("Model-assisted takeaway.",),
+        field_highlights=tuple(
+            replace(item, why="Model-assisted rationale.")
+            for item in frontier_report.field_highlights
+        ),
+    )
+    digest = DailyDigest(
+        source="arxiv",
+        category=BIOMEDICAL_LATEST_MODE,
+        target_date=date(2026, 3, 24),
+        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
+        feed_url="https://export.arxiv.org/api/query",
+        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        ranked=ranked,
+        frontier_report=mutated_report,
+        searched_categories=("q-bio",),
+        per_category_counts={"q-bio": 1},
+        total_fetched=1,
+        requested_report_mode="enhanced",
+        report_mode="enhanced",
+        cost_mode="model-assisted",
+        enhanced_track="frontier-report",
+        enhanced_item_count=2,
+        llm_requested=True,
+        llm_applied=True,
+        llm_provider="openai-compatible",
+        llm_seconds=1.0,
+    )
+
+    restored = app._digest_for_report_mode(digest, report_mode=DEFAULT_REPORT_MODE)
+
+    assert restored.report_mode == "deterministic"
+    assert restored.cost_mode == ZERO_TOKEN_COST_MODE
+    assert restored.llm_applied is False
+    assert restored.frontier_report is not None
+    assert restored.frontier_report.takeaways == frontier_report.takeaways
+    assert restored.frontier_report.field_highlights == frontier_report.field_highlights
 
 
 def _ranked_paper() -> RankedPaper:

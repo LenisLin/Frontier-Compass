@@ -11,6 +11,10 @@ import pytest
 from frontier_compass.api import DailyRunResult, FrontierCompassRunner, LocalUISession
 from frontier_compass.cli.main import build_parser, main
 from frontier_compass.common.frontier_report import build_daily_frontier_report
+from frontier_compass.common.source_bundles import (
+    SOURCE_BUNDLE_AI_FOR_MEDICINE,
+    SOURCE_BUNDLE_BIOMEDICAL,
+)
 from frontier_compass.reporting.html_report import HtmlReportBuilder
 from frontier_compass.storage.schema import (
     DailyDigest,
@@ -28,7 +32,6 @@ from frontier_compass.ui.app import (
     BIOMEDICAL_MULTISOURCE_MODE,
     DEFAULT_ARXIV_CATEGORY,
     DailyBootstrapResult,
-    DailyPreparationResult,
     FrontierCompassApp,
 )
 from frontier_compass.zotero.profile_builder import ZoteroProfileBuilder
@@ -123,7 +126,7 @@ def test_cli_daily_help_lists_fixed_modes() -> None:
     assert BIOMEDICAL_MULTISOURCE_MODE in result.stdout
     assert BIOMEDICAL_DISCOVERY_MODE in result.stdout
     assert BIOMEDICAL_DAILY_MODE in result.stdout
-    assert "this command uses biomedical-latest" in result.stdout
+    assert "default public 2-source bundle" in result.stdout
 
 
 def test_cli_run_daily_accepts_multisource_mode(monkeypatch, capsys, tmp_path: Path) -> None:
@@ -159,19 +162,19 @@ def test_cli_run_daily_accepts_multisource_mode(monkeypatch, capsys, tmp_path: P
     assert main(["run-daily", "--mode", BIOMEDICAL_MULTISOURCE_MODE, "--today", "2026-03-24"]) == 0
     output = capsys.readouterr().out
 
-    assert f"Selected source: {BIOMEDICAL_MULTISOURCE_MODE} (cli)" in output
-    assert f"Mode: {BIOMEDICAL_MULTISOURCE_MODE}" in output
+    assert "Source path: compatibility 3-source run (arXiv + bioRxiv + medRxiv) (cli)" in output
+    assert "Source run: compatibility 3-source run (arXiv + bioRxiv + medRxiv)" in output
 
 
 def test_cli_ui_print_command_accepts_multisource_mode(capsys) -> None:
     assert main(["ui", "--print-command", "--mode", BIOMEDICAL_MULTISOURCE_MODE, "--today", "2026-03-24"]) == 0
     output = capsys.readouterr().out
 
-    assert f"Selected source: {BIOMEDICAL_MULTISOURCE_MODE} (cli)" in output
+    assert "Source path: compatibility 3-source run (arXiv + bioRxiv + medRxiv) (cli)" in output
     assert f"--source {BIOMEDICAL_MULTISOURCE_MODE}" in output
 
 
-def test_cli_ui_print_command_auto_selects_zotero_when_both_zotero_inputs_are_supplied(capsys) -> None:
+def test_cli_ui_print_command_requires_explicit_profile_source_when_both_zotero_inputs_are_supplied(capsys) -> None:
     assert (
         main(
             [
@@ -185,18 +188,13 @@ def test_cli_ui_print_command_auto_selects_zotero_when_both_zotero_inputs_are_su
                 "/tmp/zotero.sqlite",
             ]
         )
-        == 0
+        == 1
     )
-    output = capsys.readouterr().out
+    error_output = capsys.readouterr().err
 
-    assert "Profile source: zotero (derived)" in output
-    assert (
-        "Profile source auto-selected: zotero because both a Zotero DB path and Zotero export were supplied."
-        in output
-    )
-    assert "--profile-source zotero" in output
-    assert f"--zotero-export {ZOTERO_FIXTURE_PATH}" in output
-    assert "--zotero-db-path /tmp/zotero.sqlite" in output
+    assert "Both a Zotero export path and a Zotero DB path were supplied without an explicit profile_source." in error_output
+    assert "profile_source='zotero_export'" in error_output
+    assert "profile_source='live_zotero_db'" in error_output
 
 
 def test_cli_parser_accepts_multisource_mode_for_all_public_daily_commands() -> None:
@@ -219,6 +217,29 @@ def test_cli_parser_accepts_multisource_mode_for_all_public_daily_commands() -> 
     assert ui_args.mode == BIOMEDICAL_MULTISOURCE_MODE
     assert daily_args.mode == BIOMEDICAL_MULTISOURCE_MODE
     assert deliver_args.mode == BIOMEDICAL_MULTISOURCE_MODE
+
+
+def test_cli_run_daily_accepts_ai_for_medicine_mode(monkeypatch, capsys, tmp_path: Path) -> None:
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_AI_FOR_MEDICINE)
+
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs["source"] == SOURCE_BUNDLE_AI_FOR_MEDICINE
+        return DailyRunResult(
+            digest=digest,
+            cache_path=tmp_path / "frontier_compass_multisource_ai-for-medicine_2026-03-24.json",
+            report_path=tmp_path / "frontier_compass_multisource_ai-for-medicine_2026-03-24.html",
+            display_source="freshly fetched",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
+        )
+
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
+
+    assert main(["run-daily", "--mode", SOURCE_BUNDLE_AI_FOR_MEDICINE, "--today", "2026-03-24"]) == 0
+    output = capsys.readouterr().out
+
+    assert "Source path: advanced AI for medicine bundle override (cli)" in output
+    assert "Source run: advanced AI for medicine bundle override" in output
 
 
 def test_cli_demo_report_writes_file(tmp_path: Path) -> None:
@@ -273,13 +294,13 @@ def test_cli_daily_writes_cache_and_report(tmp_path: Path) -> None:
     assert cache.exists()
     assert report.exists()
     assert "Fetch status: fresh source fetch" in result.stdout
-    assert "Tracks: Personalized Digest + Frontier Report" in result.stdout
+    assert "Tracks: Digest + Frontier Report" in result.stdout
     assert "Requested date: 2026-03-23" in result.stdout
     assert "Effective displayed date: 2026-03-23" in result.stdout
     assert "Latest-available display fallback: no" in result.stdout
     assert "Stale cache fallback: no" in result.stdout
     assert "Display basis: Strict same-day results" in result.stdout
-    assert "Mode: q-bio" in result.stdout
+    assert "Source run: q-bio" in result.stdout
     assert "Searched categories: q-bio" in result.stdout
     assert "Strict same-day fetched: 1" in result.stdout
     assert "Strict same-day ranked: 1" in result.stdout
@@ -291,60 +312,38 @@ def test_cli_daily_writes_cache_and_report(tmp_path: Path) -> None:
 
 
 def test_cli_daily_defaults_to_reviewer_mode(monkeypatch, capsys, tmp_path: Path) -> None:
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["mode"] == BIOMEDICAL_LATEST_MODE
-        assert "category" not in kwargs
-        digest = DailyDigest(
-            source="arxiv",
-            category=BIOMEDICAL_LATEST_MODE,
-            target_date=date(2026, 3, 24),
-            generated_at=datetime(2026, 3, 24, 7, 0, tzinfo=timezone.utc),
-            feed_url="https://export.arxiv.org/api/query",
-            profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-            ranked=[
-                RankedPaper(
-                    paper=PaperRecord(
-                        source="arxiv",
-                        identifier="2603.21990v1",
-                        title="Default reviewer path paper",
-                        summary="Reviewer-safe default path coverage.",
-                        authors=("A Scientist",),
-                        categories=("q-bio.GN", "cs.LG"),
-                        published=date(2026, 3, 24),
-                        url="https://arxiv.org/abs/2603.21990",
-                    ),
-                    score=0.87,
-                    recommendation_summary="Default reviewer path biomedical match.",
-                )
-            ],
-            searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
-            per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.LG": 1},
-            total_fetched=3,
-            feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-            mode_label="Biomedical latest available",
-            mode_kind="latest-available-hybrid",
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-        )
-        return DailyPreparationResult(
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
+
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        assert kwargs["source"] == SOURCE_BUNDLE_BIOMEDICAL
+        assert kwargs["requested_date"] == date(2026, 3, 24)
+        assert kwargs["max_results"] == 80
+        assert kwargs["refresh"] is True
+        assert kwargs["allow_stale_cache"] is False
+        return DailyRunResult(
             digest=digest,
-            cache_path=tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json",
-            report_path=tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html",
+            cache_path=tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json",
+            report_path=tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html",
+            display_source="freshly fetched",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
         )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert main(["daily", "--today", "2026-03-24", "--max-results", "80"]) == 0
     output = capsys.readouterr().out
 
     assert "Fetch status: fresh source fetch" in output
-    assert "Mode: biomedical-latest" in output
-    assert "Mode label: Biomedical latest available" in output
+    assert "Source run: default public bundle (arXiv + bioRxiv)" in output
+    assert "Advanced source id:" not in output
 
 
 def test_cli_daily_biomedical_mode_prints_bundle_summary(monkeypatch, capsys, tmp_path: Path) -> None:
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["mode"] == BIOMEDICAL_DAILY_MODE
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        assert kwargs["source"] == BIOMEDICAL_DAILY_MODE
         digest = DailyDigest(
             source="arxiv",
             category=BIOMEDICAL_DAILY_MODE,
@@ -380,13 +379,16 @@ def test_cli_daily_biomedical_mode_prints_bundle_summary(monkeypatch, capsys, tm
             mode_kind="bundle",
             mode_notes="Bundle-based same-day q-bio scouting.",
         )
-        return DailyPreparationResult(
+        return DailyRunResult(
             digest=digest,
             cache_path=tmp_path / "frontier_compass_arxiv_biomedical-daily_2026-03-24.json",
             report_path=tmp_path / "frontier_compass_arxiv_biomedical-daily_2026-03-24.html",
+            display_source="freshly fetched",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
         )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert main(["daily", "--mode", BIOMEDICAL_DAILY_MODE, "--today", "2026-03-24", "--max-results", "80"]) == 0
     output = capsys.readouterr().out
@@ -396,9 +398,10 @@ def test_cli_daily_biomedical_mode_prints_bundle_summary(monkeypatch, capsys, tm
     assert "Effective displayed date: 2026-03-24" in output
     assert "Latest-available display fallback: no" in output
     assert "Stale cache fallback: no" in output
-    assert f"Mode: {BIOMEDICAL_DAILY_MODE}" in output
-    assert "Mode label: Biomedical daily" in output
-    assert "Mode kind: bundle" in output
+    assert "Source run: advanced q-bio bundle mode" in output
+    assert f"Advanced source id: {BIOMEDICAL_DAILY_MODE}" in output
+    assert "Advanced source label: Biomedical daily" in output
+    assert "Advanced source kind: bundle" in output
     assert "Searched categories: q-bio, q-bio.GN, q-bio.QM" in output
     assert "Mode notes: Bundle-based same-day q-bio scouting." in output
     assert "Strict same-day fetched: 2" in output
@@ -410,8 +413,9 @@ def test_cli_daily_biomedical_mode_prints_bundle_summary(monkeypatch, capsys, tm
 
 
 def test_cli_daily_discovery_mode_prints_search_metadata(monkeypatch, capsys, tmp_path: Path) -> None:
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["mode"] == BIOMEDICAL_DISCOVERY_MODE
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        assert kwargs["source"] == BIOMEDICAL_DISCOVERY_MODE
         digest = DailyDigest(
             source="arxiv",
             category=BIOMEDICAL_DISCOVERY_MODE,
@@ -451,13 +455,16 @@ def test_cli_daily_discovery_mode_prints_search_metadata(monkeypatch, capsys, tm
                 ),
             ),
         )
-        return DailyPreparationResult(
+        return DailyRunResult(
             digest=digest,
             cache_path=tmp_path / "frontier_compass_arxiv_biomedical-discovery_2026-03-24.json",
             report_path=tmp_path / "frontier_compass_arxiv_biomedical-discovery_2026-03-24.html",
+            display_source="freshly fetched",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
         )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert main(["daily", "--mode", BIOMEDICAL_DISCOVERY_MODE, "--today", "2026-03-24", "--max-results", "80"]) == 0
     output = capsys.readouterr().out
@@ -467,9 +474,10 @@ def test_cli_daily_discovery_mode_prints_search_metadata(monkeypatch, capsys, tm
     assert "Effective displayed date: 2026-03-24" in output
     assert "Latest-available display fallback: no" in output
     assert "Stale cache fallback: no" in output
-    assert f"Mode: {BIOMEDICAL_DISCOVERY_MODE}" in output
-    assert "Mode label: Biomedical discovery" in output
-    assert "Mode kind: hybrid" in output
+    assert "Source run: advanced biomedical discovery mode" in output
+    assert f"Advanced source id: {BIOMEDICAL_DISCOVERY_MODE}" in output
+    assert "Advanced source label: Biomedical discovery" in output
+    assert "Advanced source kind: hybrid" in output
     assert "Search profile: broader-biomedical-discovery-v1" in output
     assert "Mode notes: Hybrid q-bio bundle plus fixed broader arXiv API discovery queries." in output
     assert 'Query 1: ((cat:q-bio OR cat:cs.LG) AND (all:bioinformatics OR all:"single-cell"))' in output
@@ -485,8 +493,9 @@ def test_cli_daily_discovery_mode_prints_search_metadata(monkeypatch, capsys, tm
 
 
 def test_cli_daily_latest_mode_prints_requested_and_effective_dates(monkeypatch, capsys, tmp_path: Path) -> None:
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["mode"] == BIOMEDICAL_LATEST_MODE
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        assert kwargs["source"] == BIOMEDICAL_LATEST_MODE
         digest = DailyDigest(
             source="arxiv",
             category=BIOMEDICAL_LATEST_MODE,
@@ -525,13 +534,16 @@ def test_cli_daily_latest_mode_prints_requested_and_effective_dates(monkeypatch,
             strict_same_day_ranked=0,
             used_latest_available_fallback=True,
         )
-        return DailyPreparationResult(
+        return DailyRunResult(
             digest=digest,
             cache_path=tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json",
             report_path=tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html",
+            display_source="freshly fetched",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
         )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert main(["daily", "--mode", BIOMEDICAL_LATEST_MODE, "--today", "2026-03-24", "--max-results", "80"]) == 0
     output = capsys.readouterr().out
@@ -542,9 +554,10 @@ def test_cli_daily_latest_mode_prints_requested_and_effective_dates(monkeypatch,
     assert "Latest-available display fallback: yes" in output
     assert "Stale cache fallback: no" in output
     assert "Display basis: Latest available fallback results" in output
-    assert f"Mode: {BIOMEDICAL_LATEST_MODE}" in output
-    assert "Mode label: Biomedical latest available" in output
-    assert "Mode kind: latest-available-hybrid" in output
+    assert "Source run: legacy latest-available biomedical mode" in output
+    assert f"Advanced source id: {BIOMEDICAL_LATEST_MODE}" in output
+    assert "Advanced source label: Biomedical latest available" in output
+    assert "Advanced source kind: latest-available-hybrid" in output
     assert "Strict same-day fetched: 0" in output
     assert "Strict same-day ranked: 0" in output
     assert "Total fetched: 3" in output
@@ -553,41 +566,33 @@ def test_cli_daily_latest_mode_prints_requested_and_effective_dates(monkeypatch,
 
 
 def test_cli_daily_reuses_same_date_cache_after_fetch_failure(monkeypatch, capsys, tmp_path: Path) -> None:
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 0, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[RankedPaper(paper=PaperRecord(
-            source="arxiv",
-            identifier="2603.21990v1",
-            title="Cached reviewer path paper",
-            summary="Cached reviewer-safe coverage.",
-            authors=("A Scientist",),
-            categories=("q-bio.GN", "cs.LG"),
-            published=date(2026, 3, 24),
-            url="https://arxiv.org/abs/2603.21990",
-        ), score=0.87, recommendation_summary="Cached reviewer path biomedical match.")],
-        searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.LG": 1},
-        total_fetched=3,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
     _write_digest_cache(cache_path, digest)
 
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        del self, kwargs
-        raise RuntimeError("upstream arXiv timeout")
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        assert kwargs["source"] == SOURCE_BUNDLE_BIOMEDICAL
+        report_path.write_text(
+            HtmlReportBuilder().render_daily_digest(
+                digest,
+                acquisition_status_label="same-date cache reused after fetch failure",
+                fetch_error="upstream arXiv timeout",
+            ),
+            encoding="utf-8",
+        )
+        return DailyRunResult(
+            digest=digest,
+            cache_path=cache_path,
+            report_path=report_path,
+            display_source="same-date cache reused after fetch failure",
+            fetch_error="upstream arXiv timeout",
+            fetch_status_label="same-date cache reused after fetch failure",
+            artifact_source_label="same-day cache",
+        )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert (
         main(
@@ -619,21 +624,19 @@ def test_cli_daily_reuses_same_date_cache_after_fetch_failure(monkeypatch, capsy
 
 
 def test_cli_daily_fails_clearly_when_no_same_date_cache_exists(monkeypatch, capsys) -> None:
-    def fake_write_daily_outputs(self, **kwargs):  # type: ignore[no-untyped-def]
-        del self, kwargs
-        raise RuntimeError("upstream arXiv timeout")
+    def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        raise RuntimeError(
+            "Fresh source fetch failed for biomedical on 2026-03-24 and no same-date cache is available: "
+            "upstream arXiv timeout"
+        )
 
-    monkeypatch.setattr(FrontierCompassApp, "write_daily_outputs", fake_write_daily_outputs)
-    monkeypatch.setattr(
-        FrontierCompassApp,
-        "_load_requested_daily_digest_for_materialization",
-        lambda self, **kwargs: None,
-    )
+    monkeypatch.setattr(FrontierCompassRunner, "run_daily", fake_run_daily)
 
     assert main(["daily", "--today", "2026-03-24", "--max-results", "80"]) == 1
     error_output = capsys.readouterr().err
 
-    assert "Fresh source fetch failed for biomedical-latest on 2026-03-24" in error_output
+    assert "Fresh source fetch failed for biomedical on 2026-03-24" in error_output
     assert "no same-date cache is available" in error_output
 
 
@@ -655,41 +658,10 @@ def test_cli_daily_rejects_feed_url_with_fixed_modes() -> None:
 
 
 def test_cli_deliver_daily_dry_run_writes_eml_and_prints_provenance(monkeypatch, capsys, tmp_path: Path) -> None:
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
-    eml_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.eml"
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 0, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[
-            RankedPaper(
-                paper=PaperRecord(
-                    source="arxiv",
-                    identifier="2603.21990v1",
-                    title="Cached reviewer path paper",
-                    summary="Cached reviewer-safe coverage.",
-                    authors=("A Scientist",),
-                    categories=("q-bio.GN", "cs.LG"),
-                    published=date(2026, 3, 24),
-                    url="https://arxiv.org/abs/2603.21990",
-                ),
-                score=0.87,
-                recommendation_summary="Cached reviewer path biomedical match.",
-            )
-        ],
-        searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.LG": 1},
-        total_fetched=3,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
+    eml_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.eml"
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
     report_path.write_text(
         HtmlReportBuilder().render_daily_digest(
             digest,
@@ -700,7 +672,7 @@ def test_cli_deliver_daily_dry_run_writes_eml_and_prints_provenance(monkeypatch,
     )
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["selected_source"] == BIOMEDICAL_LATEST_MODE
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["max_results"] == 80
         assert kwargs["force_fetch"] is False
@@ -833,34 +805,35 @@ def test_cli_deliver_daily_send_requires_smtp_settings(monkeypatch, capsys, tmp_
 
 def test_cli_daily_zotero_export_prints_profile_provenance(monkeypatch, capsys, tmp_path: Path) -> None:
     profile = ZoteroProfileBuilder().build_augmented_profile(
-        FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        FrontierCompassApp.daily_profile(SOURCE_BUNDLE_BIOMEDICAL),
         export_path=ZOTERO_FIXTURE_PATH,
     )
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert kwargs["selected_source"] == BIOMEDICAL_LATEST_MODE
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["zotero_export_path"] == ZOTERO_FIXTURE_PATH
         cache_path = FrontierCompassApp.default_daily_cache_path(
-            BIOMEDICAL_LATEST_MODE,
+            SOURCE_BUNDLE_BIOMEDICAL,
             date(2026, 3, 24),
             zotero_export_path=ZOTERO_FIXTURE_PATH,
         )
         report_path = FrontierCompassApp.report_path_for_cache_path(cache_path)
         digest = DailyDigest(
-            source="arxiv",
-            category=BIOMEDICAL_LATEST_MODE,
+            source="multisource",
+            category=SOURCE_BUNDLE_BIOMEDICAL,
             target_date=date(2026, 3, 24),
             generated_at=datetime(2026, 3, 24, 7, 0, tzinfo=timezone.utc),
-            feed_url="https://export.arxiv.org/api/query",
+            feed_url="",
             profile=profile,
             ranked=[_sample_ranked_paper_for_cli(score=0.91)],
             searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
             per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.LG": 1},
-            total_fetched=3,
+            total_fetched=2,
+            source_counts={"arxiv": 1, "biorxiv": 1},
             feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-            mode_label="Biomedical latest available",
-            mode_kind="latest-available-hybrid",
+            mode_label="Biomedical",
+            mode_kind="source-bundle",
             requested_date=date(2026, 3, 24),
             effective_date=date(2026, 3, 24),
         )
@@ -925,7 +898,7 @@ def test_cli_daily_uses_config_defaults_when_args_omitted(monkeypatch, capsys, t
     output = capsys.readouterr().out
 
     assert f"Config: loaded from {config_path}" in output
-    assert f"Selected source: {BIOMEDICAL_DISCOVERY_MODE} (config)" in output
+    assert "Source path: advanced biomedical discovery mode (config)" in output
     assert "Max results: 33 (config)" in output
     assert f"Zotero export: {ZOTERO_FIXTURE_PATH} (config)" in output
 
@@ -976,7 +949,7 @@ def test_cli_daily_cli_values_override_config(monkeypatch, capsys, tmp_path: Pat
     )
     output = capsys.readouterr().out
 
-    assert f"Selected source: {BIOMEDICAL_DAILY_MODE} (cli)" in output
+    assert "Source path: advanced q-bio bundle mode (cli)" in output
     assert "Max results: 7 (cli)" in output
     assert f"Zotero export: {override_zotero} (cli)" in output
 
@@ -1078,13 +1051,13 @@ def test_cli_run_daily_uses_config_dry_run_defaults(monkeypatch, capsys, tmp_pat
 
 
 def test_cli_run_daily_no_config_uses_built_in_defaults(monkeypatch, capsys, tmp_path: Path) -> None:
-    digest = _sample_daily_digest_for_cli(BIOMEDICAL_LATEST_MODE)
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
 
     def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
         assert isinstance(self, FrontierCompassRunner)
-        assert kwargs["source"] == BIOMEDICAL_LATEST_MODE
+        assert kwargs["source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["max_results"] == 80
         assert kwargs["refresh"] is False
@@ -1104,8 +1077,8 @@ def test_cli_run_daily_no_config_uses_built_in_defaults(monkeypatch, capsys, tmp
     output = capsys.readouterr().out
 
     assert "Config: disabled by --no-config" in output
-    assert "Tracks: Personalized Digest + Frontier Report" in output
-    assert f"Selected source: {BIOMEDICAL_LATEST_MODE} (built-in)" in output
+    assert "Tracks: Digest + Frontier Report" in output
+    assert "Source path: default public bundle (arXiv + bioRxiv) (built-in)" in output
     assert "Max results: 80 (built-in)" in output
     assert "Allow stale cache fallback: yes (built-in)" in output
     assert "Dry-run email: no (built-in)" in output
@@ -1113,13 +1086,13 @@ def test_cli_run_daily_no_config_uses_built_in_defaults(monkeypatch, capsys, tmp
 
 
 def test_cli_run_daily_range_window_derives_range_full(monkeypatch, capsys, tmp_path: Path) -> None:
-    digest = _sample_daily_digest_for_cli(BIOMEDICAL_LATEST_MODE)
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.html"
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.html"
 
     def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
         assert isinstance(self, FrontierCompassRunner)
-        assert kwargs["source"] == BIOMEDICAL_LATEST_MODE
+        assert kwargs["source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["start_date"] == date(2026, 3, 24)
         assert kwargs["end_date"] == date(2026, 3, 25)
@@ -1232,14 +1205,14 @@ def test_cli_run_daily_prints_stale_cache_provenance(monkeypatch, capsys, tmp_pa
 
 
 def test_cli_daily_routes_through_public_runner(monkeypatch, capsys, tmp_path: Path) -> None:
-    digest = _sample_daily_digest_for_cli(BIOMEDICAL_LATEST_MODE)
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+    digest = _sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL)
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
 
     def fake_run_daily(self, **kwargs):  # type: ignore[no-untyped-def]
         assert isinstance(self, FrontierCompassRunner)
         assert kwargs == {
-            "source": BIOMEDICAL_LATEST_MODE,
+            "source": SOURCE_BUNDLE_BIOMEDICAL,
             "requested_date": date(2026, 3, 24),
             "max_results": 80,
             "refresh": True,
@@ -1265,7 +1238,7 @@ def test_cli_daily_routes_through_public_runner(monkeypatch, capsys, tmp_path: P
     output = capsys.readouterr().out
 
     assert "Fetch status: fresh source fetch" in output
-    assert "Mode: biomedical-latest" in output
+    assert "Source run: default public bundle (arXiv + bioRxiv)" in output
 
 
 def test_cli_history_prints_recent_runs(monkeypatch, capsys) -> None:
@@ -1290,7 +1263,7 @@ def test_cli_history_prints_recent_runs(monkeypatch, capsys) -> None:
     assert main(["history"]) == 0
     output = capsys.readouterr().out
 
-    assert "Recent runs (latest first)" in output
+    assert "Recent runs (current-contract first)" in output
     assert "2026-03-24 | Biomedical latest available" in output
     assert "Requested -> showing: 2026-03-24" in output
     assert "Request window: 2026-03-24" in output
@@ -1299,12 +1272,46 @@ def test_cli_history_prints_recent_runs(monkeypatch, capsys) -> None:
         "fresh source fetch | ranked 12 | report deterministic/ready | zero-token | biomedical baseline | "
         "arxiv 12/12 [live-success; ready; fresh] | time 0.35s | zotero sample_library.csl.json | exploration 2"
     ) in output
+    assert "LLM requested no | applied no | provider none | fallback none | time n/a" in output
     assert "Frontier Report present: yes" in output
     assert "Sources: arxiv fetched 12 / retained 12 [live-success; ready; fresh] (total 0.35s)" in output
     assert "Run timings: total 0.35s" in output
     assert "Report: reports/daily/frontier_compass_arxiv_biomedical-latest_2026-03-24.html" in output
     assert "Cache: data/cache/frontier_compass_arxiv_biomedical-latest_2026-03-24.json" in output
     assert "EML: reports/daily/frontier_compass_arxiv_biomedical-latest_2026-03-24.eml" in output
+
+
+def test_cli_history_separates_compatibility_entries(monkeypatch, capsys) -> None:
+    current_entry = _sample_run_history_entry(
+        requested_date=date(2026, 3, 24),
+        effective_date=date(2026, 3, 24),
+        generated_at=datetime(2026, 3, 27, 2, 9, 45, tzinfo=timezone.utc),
+        fetch_status="fresh source fetch",
+        report_path="reports/daily/frontier_compass_arxiv_biomedical-latest_2026-03-24.html",
+    )
+    compatibility_entry = _sample_run_history_entry(
+        requested_date=date(2026, 3, 25),
+        effective_date=date(2026, 3, 25),
+        generated_at=datetime(2026, 3, 27, 3, 9, 45, tzinfo=timezone.utc),
+        fetch_status="fresh source fetch",
+        report_path="reports/daily/live_validation/frontier_compass_arxiv_biomedical-latest_2026-03-25_zotero-old.html",
+        compatibility_status="archived",
+        compatibility_reasons=("archived live-validation artifact",),
+    )
+
+    def fake_recent_daily_runs(self, *, limit=10, cache_dir=None, report_dir=None):  # type: ignore[no-untyped-def]
+        assert limit == 10
+        del self, cache_dir, report_dir
+        return [current_entry, compatibility_entry]
+
+    monkeypatch.setattr(FrontierCompassApp, "recent_daily_runs", fake_recent_daily_runs)
+
+    assert main(["history"]) == 0
+    output = capsys.readouterr().out
+
+    assert "Recent runs (current-contract first)" in output
+    assert "Compatibility / archived entries" in output
+    assert "Compatibility: compatibility / archived: archived live-validation artifact" in output
 
 
 def test_cli_history_routes_through_public_runner(monkeypatch, capsys) -> None:
@@ -1404,10 +1411,11 @@ def test_cli_ui_print_command_reports_launch_path(capsys) -> None:
     assert "-m streamlit run" in output
     assert "--server.headless true" in output
     assert "--server.port 8601" in output
-    assert (
-        "-- --source biomedical-latest --requested-date 2026-03-24 --max-results 80 "
-        "--report-mode deterministic --allow-stale-cache"
-    ) in output
+    assert "-- --requested-date 2026-03-24" in output
+    assert "--source biomedical" not in output
+    assert "--max-results 80" not in output
+    assert "--report-mode deterministic" not in output
+    assert "--allow-stale-cache" not in output
 
 
 def test_cli_ui_print_command_range_window_includes_range_full_fetch_scope(capsys) -> None:
@@ -1490,9 +1498,9 @@ def test_cli_ui_prewarms_session_before_launch(monkeypatch, capsys) -> None:
         recorded_prepare.update(kwargs)
         return LocalUISession(
             current_run=DailyRunResult(
-                digest=_sample_daily_digest_for_cli(BIOMEDICAL_LATEST_MODE),
-                cache_path=Path("data/cache/frontier_compass_arxiv_biomedical-latest_2026-03-24.json"),
-                report_path=Path("reports/daily/frontier_compass_arxiv_biomedical-latest_2026-03-24.html"),
+                digest=_sample_daily_digest_for_cli(SOURCE_BUNDLE_BIOMEDICAL),
+                cache_path=Path("data/cache/frontier_compass_bundle_biomedical_2026-03-24.json"),
+                report_path=Path("reports/daily/frontier_compass_bundle_biomedical_2026-03-24.html"),
                 display_source="freshly fetched",
                 fetch_status_label="fresh source fetch",
                 artifact_source_label="fresh source fetch",
@@ -1540,32 +1548,23 @@ def test_cli_ui_prewarms_session_before_launch(monkeypatch, capsys) -> None:
     output = capsys.readouterr().out
 
     assert recorded_prepare == {
-        "source": BIOMEDICAL_LATEST_MODE,
+        "source": SOURCE_BUNDLE_BIOMEDICAL,
         "requested_date": date(2026, 3, 24),
         "max_results": 80,
         "refresh": True,
         "allow_stale_cache": True,
-        "profile_source": "zotero",
+        "profile_source": "zotero_export",
         "zotero_export_path": ZOTERO_FIXTURE_PATH,
     }
     assert recorded_command["startup_args"] == [
-        "--source",
-        BIOMEDICAL_LATEST_MODE,
         "--requested-date",
         "2026-03-24",
-        "--max-results",
-        "80",
-        "--report-mode",
-        "deterministic",
-        "--allow-stale-cache",
-        "--profile-source",
-        "zotero",
         "--zotero-export",
         str(ZOTERO_FIXTURE_PATH),
     ]
     assert recorded_command["check"] is False
-    assert "Current UI digest: Biomedical latest available" in output
-    assert "Tracks: Personalized Digest + Frontier Report" in output
+    assert "Current UI run: default public bundle (arXiv + bioRxiv)" in output
+    assert "Tracks: Digest + Frontier Report" in output
     assert "Refresh prewarm: yes" in output
     assert "Launching FrontierCompass UI from /tmp/custom_streamlit_app.py" in output
 
@@ -1606,17 +1605,8 @@ def test_cli_ui_launches_even_when_prewarm_fails(monkeypatch, capsys) -> None:
     captured = capsys.readouterr()
 
     assert recorded_command["startup_args"] == [
-        "--source",
-        BIOMEDICAL_LATEST_MODE,
         "--requested-date",
         "2026-03-24",
-        "--max-results",
-        "80",
-        "--report-mode",
-        "deterministic",
-        "--allow-stale-cache",
-        "--profile-source",
-        "baseline",
         "--skip-initial-load",
     ]
     assert recorded_command["check"] is False
@@ -1650,22 +1640,29 @@ def _sample_ranked_paper_for_cli(*, score: float) -> RankedPaper:
 
 def _sample_daily_digest_for_cli(category: str) -> DailyDigest:
     mode_label = {
+        SOURCE_BUNDLE_BIOMEDICAL: "Biomedical",
+        SOURCE_BUNDLE_AI_FOR_MEDICINE: "AI for medicine",
+        BIOMEDICAL_MULTISOURCE_MODE: "Biomedical multisource",
         BIOMEDICAL_LATEST_MODE: "Biomedical latest available",
         BIOMEDICAL_DISCOVERY_MODE: "Biomedical discovery",
         BIOMEDICAL_DAILY_MODE: "Biomedical daily",
     }.get(category, category)
     mode_kind = {
+        SOURCE_BUNDLE_BIOMEDICAL: "source-bundle",
+        SOURCE_BUNDLE_AI_FOR_MEDICINE: "source-bundle",
+        BIOMEDICAL_MULTISOURCE_MODE: "multisource",
         BIOMEDICAL_LATEST_MODE: "latest-available-hybrid",
         BIOMEDICAL_DISCOVERY_MODE: "hybrid",
         BIOMEDICAL_DAILY_MODE: "bundle",
     }.get(category, "category-feed")
+    is_source_bundle = category in {SOURCE_BUNDLE_BIOMEDICAL, SOURCE_BUNDLE_AI_FOR_MEDICINE}
     ranked = [_sample_ranked_paper_for_cli(score=0.88)]
     return DailyDigest(
-        source="arxiv",
+        source="multisource" if category == BIOMEDICAL_MULTISOURCE_MODE or is_source_bundle else "arxiv",
         category=category,
         target_date=date(2026, 3, 24),
         generated_at=datetime(2026, 3, 24, 7, 0, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
+        feed_url="" if category == BIOMEDICAL_MULTISOURCE_MODE or is_source_bundle else "https://export.arxiv.org/api/query",
         profile=FrontierCompassApp.daily_profile(category),
         ranked=ranked,
         frontier_report=build_daily_frontier_report(
@@ -1673,16 +1670,21 @@ def _sample_daily_digest_for_cli(category: str) -> DailyDigest:
             ranked_papers=ranked,
             requested_date=date(2026, 3, 24),
             effective_date=date(2026, 3, 24),
-            source="arxiv",
+            source="multisource" if category == BIOMEDICAL_MULTISOURCE_MODE or is_source_bundle else "arxiv",
             mode=category,
             mode_label=mode_label,
             mode_kind=mode_kind,
             searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
-            total_fetched=3,
+            total_fetched=3 if category == BIOMEDICAL_MULTISOURCE_MODE else 2 if is_source_bundle else 3,
         ),
         searched_categories=("q-bio", "q-bio.GN", "cs.LG"),
         per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.LG": 1},
-        total_fetched=3,
+        total_fetched=3 if category == BIOMEDICAL_MULTISOURCE_MODE else 2 if is_source_bundle else 3,
+        source_counts={"arxiv": 1, "biorxiv": 1, "medrxiv": 1}
+        if category == BIOMEDICAL_MULTISOURCE_MODE
+        else {"arxiv": 1, "biorxiv": 1}
+        if is_source_bundle
+        else {},
         feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
         mode_label=mode_label,
         mode_kind=mode_kind,
@@ -1699,6 +1701,8 @@ def _sample_run_history_entry(
     fetch_status: str,
     report_path: str,
     eml_path: str | None = None,
+    compatibility_status: str = "",
+    compatibility_reasons: tuple[str, ...] = (),
 ) -> RunHistoryEntry:
     return RunHistoryEntry(
         requested_date=requested_date,
@@ -1732,6 +1736,8 @@ def _sample_run_history_entry(
         report_path=report_path,
         eml_path=eml_path,
         generated_at=generated_at,
+        compatibility_status=compatibility_status,
+        compatibility_reasons=compatibility_reasons,
     )
 
 

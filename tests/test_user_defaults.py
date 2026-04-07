@@ -31,6 +31,7 @@ def test_load_user_defaults_parses_config_and_normalizes_recipients(
     expected_recipients: tuple[str, ...],
 ) -> None:
     config_path = tmp_path / "user_defaults.json"
+    zotero_db = tmp_path / "zotero" / "zotero.sqlite"
     zotero_export = tmp_path / "exports" / "sample.csl.json"
     config_path.write_text(
         json.dumps(
@@ -38,11 +39,15 @@ def test_load_user_defaults_parses_config_and_normalizes_recipients(
                 "default_mode": "biomedical-latest",
                 "default_report_mode": "enhanced",
                 "default_max_results": 25,
+                "default_zotero_db_path": "zotero/zotero.sqlite",
                 "default_zotero_export_path": "exports/sample.csl.json",
                 "default_email_to": email_to_value,
                 "default_email_from": "frontier@example.com",
                 "default_generate_dry_run_email": True,
                 "default_allow_stale_cache": True,
+                "default_llm_base_url": "https://example.invalid/v1",
+                "default_llm_api_key": "secret-token",
+                "default_llm_model": "gpt-5-mini",
             }
         ),
         encoding="utf-8",
@@ -55,11 +60,15 @@ def test_load_user_defaults_parses_config_and_normalizes_recipients(
     assert loaded.defaults.default_mode == "biomedical-latest"
     assert loaded.defaults.default_report_mode == "enhanced"
     assert loaded.defaults.default_max_results == 25
+    assert loaded.defaults.default_zotero_db_path == zotero_db
     assert loaded.defaults.default_zotero_export_path == zotero_export
     assert loaded.defaults.default_email_to == expected_recipients
     assert loaded.defaults.default_email_from == "frontier@example.com"
     assert loaded.defaults.default_generate_dry_run_email is True
     assert loaded.defaults.default_allow_stale_cache is True
+    assert loaded.defaults.default_llm_base_url == "https://example.invalid/v1"
+    assert loaded.defaults.default_llm_api_key == "secret-token"
+    assert loaded.defaults.default_llm_model == "gpt-5-mini"
 
 
 def test_load_user_defaults_rejects_missing_explicit_config(tmp_path: Path) -> None:
@@ -74,4 +83,26 @@ def test_load_user_defaults_rejects_invalid_json(tmp_path: Path) -> None:
     config_path.write_text("{not-json}", encoding="utf-8")
 
     with pytest.raises(ValueError, match="Invalid JSON in user defaults config"):
+        load_user_defaults(config_path=config_path)
+
+
+def test_load_user_defaults_rejects_removed_default_llm_provider_key(tmp_path: Path) -> None:
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(
+        json.dumps({"default_llm_provider": "openai-compatible"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="Unsupported keys in user defaults config"):
+        load_user_defaults(config_path=config_path)
+
+
+def test_load_user_defaults_rejects_invalid_zotero_db_type(tmp_path: Path) -> None:
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(
+        json.dumps({"default_zotero_db_path": 42}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="default_zotero_db_path must be a string."):
         load_user_defaults(config_path=config_path)

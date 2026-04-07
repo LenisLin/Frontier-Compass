@@ -15,6 +15,7 @@ from frontier_compass import (
     prepare_ui_session,
     run_daily,
 )
+from frontier_compass.common.source_bundles import SOURCE_BUNDLE_BIOMEDICAL
 from frontier_compass.storage import DailyDigest, PaperRecord, RankedPaper, RunHistoryEntry, UserInterestProfile
 from frontier_compass.ui.app import DailyBootstrapResult, FrontierCompassApp
 
@@ -132,12 +133,12 @@ def test_runner_run_daily_delegates_to_materialize_daily_digest(monkeypatch, tmp
 def test_top_level_run_daily_uses_default_runner(monkeypatch, tmp_path: Path) -> None:
     app = FrontierCompassApp()
     digest = _sample_digest()
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
         assert self is app
-        assert kwargs["selected_source"] == "biomedical-latest"
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         return DailyBootstrapResult(
             digest=digest,
@@ -159,12 +160,12 @@ def test_top_level_run_daily_uses_default_runner(monkeypatch, tmp_path: Path) ->
 def test_runner_run_daily_auto_derives_range_full_from_request_window(monkeypatch, tmp_path: Path) -> None:
     app = FrontierCompassApp()
     digest = _sample_digest()
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.html"
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.html"
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
         assert self is app
-        assert kwargs["selected_source"] == "biomedical-latest"
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["start_date"] == date(2026, 3, 24)
         assert kwargs["end_date"] == date(2026, 3, 25)
@@ -221,13 +222,13 @@ def test_runner_load_recent_history_delegates_to_app(monkeypatch) -> None:
 def test_runner_prepare_ui_session_builds_current_run_and_recent_history(monkeypatch, tmp_path: Path) -> None:
     app = FrontierCompassApp()
     digest = _sample_digest()
-    cache_path = tmp_path / "data" / "cache" / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "reports" / "daily" / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+    cache_path = tmp_path / "data" / "cache" / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "reports" / "daily" / "frontier_compass_bundle_biomedical_2026-03-24.html"
     history_entries = [_sample_history_entry()]
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
         assert self is app
-        assert kwargs["selected_source"] == "biomedical-latest"
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["max_results"] == 40
         assert kwargs["force_fetch"] is True
@@ -277,12 +278,12 @@ def test_runner_prepare_ui_session_builds_current_run_and_recent_history(monkeyp
 def test_top_level_prepare_ui_session_uses_default_runner(monkeypatch, tmp_path: Path) -> None:
     app = FrontierCompassApp()
     digest = _sample_digest()
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24.html"
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
         assert self is app
-        assert kwargs["selected_source"] == "biomedical-latest"
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         return DailyBootstrapResult(
             digest=digest,
             cache_path=cache_path,
@@ -308,12 +309,12 @@ def test_runner_prepare_ui_session_auto_derives_range_full_from_request_window(
     app = FrontierCompassApp()
     digest = _sample_digest()
     digest.fetch_scope = "range-full"
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.json"
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24_to_2026-03-25.html"
+    cache_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.json"
+    report_path = tmp_path / "frontier_compass_bundle_biomedical_2026-03-24_to_2026-03-25.html"
 
     def fake_materialize_daily_digest(self, **kwargs):  # type: ignore[no-untyped-def]
         assert self is app
-        assert kwargs["selected_source"] == "biomedical-latest"
+        assert kwargs["selected_source"] == SOURCE_BUNDLE_BIOMEDICAL
         assert kwargs["requested_date"] == date(2026, 3, 24)
         assert kwargs["start_date"] == date(2026, 3, 24)
         assert kwargs["end_date"] == date(2026, 3, 25)
@@ -340,12 +341,12 @@ def test_runner_prepare_ui_session_auto_derives_range_full_from_request_window(
 
 def _sample_digest() -> DailyDigest:
     return DailyDigest(
-        source="arxiv",
-        category="biomedical-latest",
+        source="multisource",
+        category=SOURCE_BUNDLE_BIOMEDICAL,
         target_date=date(2026, 3, 24),
         generated_at=datetime(2026, 3, 24, 8, 0, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile("biomedical-latest"),
+        feed_url="",
+        profile=FrontierCompassApp.daily_profile(SOURCE_BUNDLE_BIOMEDICAL),
         ranked=[
             RankedPaper(
                 paper=PaperRecord(
@@ -365,9 +366,10 @@ def _sample_digest() -> DailyDigest:
         searched_categories=("q-bio", "q-bio.GN", "cs.CV"),
         per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.CV": 1},
         total_fetched=1,
+        source_counts={"arxiv": 1, "biorxiv": 0},
         feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
+        mode_label="Biomedical",
+        mode_kind="source-bundle",
         requested_date=date(2026, 3, 24),
         effective_date=date(2026, 3, 24),
     )
@@ -377,9 +379,9 @@ def _sample_history_entry() -> RunHistoryEntry:
     return RunHistoryEntry(
         requested_date=date(2026, 3, 24),
         effective_date=date(2026, 3, 24),
-        category="biomedical-latest",
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
+        category=SOURCE_BUNDLE_BIOMEDICAL,
+        mode_label="Biomedical",
+        mode_kind="source-bundle",
         profile_basis="biomedical baseline",
         fetch_status="same-day cache",
         ranked_count=1,

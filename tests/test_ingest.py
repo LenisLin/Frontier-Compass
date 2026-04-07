@@ -16,6 +16,7 @@ from frontier_compass.ingest.arxiv import (
     merge_paper_batches,
 )
 from frontier_compass.ingest.biorxiv import BioRxivClient
+from frontier_compass.ingest.common import FeedRequestError
 from frontier_compass.ingest.medrxiv import MedRxivClient
 from frontier_compass.storage.schema import PaperRecord
 from frontier_compass.ui import BIOMEDICAL_LATEST_MODE, FrontierCompassApp
@@ -67,6 +68,62 @@ RSS_XML = """<?xml version="1.0" encoding="utf-8"?>
     </item>
   </channel>
 </rss>
+"""
+
+RSS10_XML = """<?xml version="1.0" encoding="UTF-8" ?>
+<rdf:RDF xmlns="http://purl.org/rss/1.0/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel rdf:about="https://biorxiv.org">
+    <title>bioRxiv Subject Collection: All</title>
+    <items>
+      <rdf:Seq>
+        <rdf:li rdf:resource="https://www.biorxiv.org/content/10.64898/2026.04.03.716344v1?rss=1"/>
+      </rdf:Seq>
+    </items>
+  </channel>
+  <item rdf:about="https://www.biorxiv.org/content/10.64898/2026.04.03.716344v1?rss=1">
+    <title>Reachable RSS 1.0 paper</title>
+    <link>https://www.biorxiv.org/content/10.64898/2026.04.03.716344v1?rss=1</link>
+    <description>bioRxiv RSS 1.0 fixture.</description>
+    <dc:date>2026-04-03T10:00:00Z</dc:date>
+    <dc:creator>Ada Lovelace</dc:creator>
+    <category>bioinformatics</category>
+  </item>
+</rdf:RDF>
+"""
+RECENT_LISTING_HTML = """<!DOCTYPE html>
+<html>
+  <body>
+    <div class="highwire-list-wrapper highwire-list-pap highwire-article-citation-list">
+      <h3 class="highwire-list-title">April 02, 2026</h3>
+      <div class="highwire-list">
+        <ul id="april-02-2026">
+          <li class="first odd">
+            <div class="highwire-article-citation" data-pisa="biorxiv;2026.04.01.716005v1" data-pisa-master="biorxiv;2026.04.01.716005">
+              <div class="highwire-cite">
+                <span class="highwire-cite-title">
+                  <a href="/content/10.64898/2026.04.01.716005v1" class="highwire-cite-linked-title">
+                    <span class="highwire-cite-title">Reachable fallback paper</span>
+                  </a>
+                </span>
+                <div class="highwire-cite-authors">
+                  <span class="highwire-citation-authors">
+                    <span class="highwire-citation-author first"><span class="nlm-given-names">Ada</span> <span class="nlm-surname">Lovelace</span></span>,
+                    <span class="highwire-citation-author"><span class="nlm-given-names">Grace</span> <span class="nlm-surname">Hopper</span></span>
+                  </span>
+                </div>
+                <div class="highwire-cite-metadata">
+                  <span class="highwire-cite-metadata-journal highwire-cite-metadata">bioRxiv </span>
+                  <span class="highwire-cite-metadata-pages highwire-cite-metadata">2026.04.01.716005; </span>
+                  <span class="highwire-cite-metadata-doi highwire-cite-metadata"><span class="doi_label">doi:</span> https://doi.org/10.64898/2026.04.01.716005 </span>
+                </div>
+              </div>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </div>
+  </body>
+</html>
 """
 ZOTERO_FIXTURE_PATH = Path(__file__).parent / "fixtures" / "zotero" / "sample_library.csl.json"
 
@@ -591,3 +648,90 @@ def test_biorxiv_and_medrxiv_rss_parser() -> None:
     assert biorxiv_papers[0].authors == ("Jane Doe",)
     assert biorxiv_papers[0].source_metadata["subject"] == "all"
     assert medrxiv_papers[0].source_metadata["feed_url"] == "https://connect.medrxiv.org/medrxiv_xml.php?subject=all"
+
+
+def test_biorxiv_and_medrxiv_rss_parser_accepts_dc_date_without_pubdate() -> None:
+    rss_with_dc_date = RSS_XML.replace(
+        "<pubDate>Mon, 23 Mar 2026 10:00:00 GMT</pubDate>",
+        "<dc:date>2026-03-23T10:00:00Z</dc:date>",
+    )
+
+    biorxiv_papers = BioRxivClient().parse_feed(
+        rss_with_dc_date,
+        subject="all",
+        feed_url="https://connect.biorxiv.org/biorxiv_xml.php?subject=all",
+    )
+    medrxiv_papers = MedRxivClient().parse_feed(
+        rss_with_dc_date.replace("biorxiv", "medrxiv"),
+        subject="all",
+        feed_url="https://connect.medrxiv.org/medrxiv_xml.php?subject=all",
+    )
+
+    assert biorxiv_papers[0].published == date(2026, 3, 23)
+    assert medrxiv_papers[0].published == date(2026, 3, 23)
+    assert biorxiv_papers[0].authors == ("Jane Doe",)
+    assert medrxiv_papers[0].authors == ("Jane Doe",)
+
+
+def test_biorxiv_and_medrxiv_rss_parser_accepts_rss10_namespace_items() -> None:
+    biorxiv_papers = BioRxivClient().parse_feed(
+        RSS10_XML,
+        subject="all",
+        feed_url="https://connect.biorxiv.org/biorxiv_xml.php?subject=all",
+    )
+    medrxiv_papers = MedRxivClient().parse_feed(
+        RSS10_XML.replace("biorxiv", "medrxiv"),
+        subject="all",
+        feed_url="https://connect.medrxiv.org/medrxiv_xml.php?subject=all",
+    )
+
+    assert biorxiv_papers[0].title == "Reachable RSS 1.0 paper"
+    assert medrxiv_papers[0].title == "Reachable RSS 1.0 paper"
+    assert biorxiv_papers[0].published == date(2026, 4, 3)
+    assert medrxiv_papers[0].published == date(2026, 4, 3)
+    assert biorxiv_papers[0].source_tags == ("bioinformatics",)
+    assert medrxiv_papers[0].authors == ("Ada Lovelace",)
+
+
+def test_biorxiv_fetch_today_falls_back_to_recent_listing(monkeypatch) -> None:
+    calls: list[str] = []
+    fallback_user_agents: list[str] = []
+
+    def fake_fetch_text(url: str, **kwargs) -> str:  # type: ignore[no-untyped-def]
+        calls.append(url)
+        if "connect.biorxiv.org" in url:
+            raise FeedRequestError("bioRxiv request timed out")
+        fallback_user_agents.append(kwargs.get("user_agent", ""))
+        return RECENT_LISTING_HTML
+
+    monkeypatch.setattr("frontier_compass.ingest.biorxiv.fetch_text", fake_fetch_text)
+
+    client = BioRxivClient()
+    papers, network_seconds, parse_seconds = client.fetch_today_with_timings(today=date(2026, 4, 2))
+
+    assert [paper.identifier for paper in papers] == ["10.64898/2026.04.01.716005v1"]
+    assert papers[0].authors == ("Ada Lovelace", "Grace Hopper")
+    assert papers[0].source_metadata["feed_kind"] == "recent-html"
+    assert client.last_fetch_details is not None
+    assert client.last_fetch_details.contract_mode == "recent-html"
+    assert client.last_fetch_details.endpoint == client.recent_listing_url
+    assert "Primary RSS feed" in client.last_fetch_details.note
+    assert calls == [client.build_feed_url("all"), client.recent_listing_url]
+    assert fallback_user_agents == [client.recent_listing_user_agent]
+    assert network_seconds >= 0.0
+    assert parse_seconds >= 0.0
+
+
+def test_medrxiv_recent_listing_fails_truthfully_for_unavailable_historical_date(monkeypatch) -> None:
+    def fake_fetch_text(url: str, **kwargs) -> str:  # type: ignore[no-untyped-def]
+        del kwargs
+        if "connect.medrxiv.org" in url:
+            raise FeedRequestError("medRxiv request timed out")
+        return RECENT_LISTING_HTML.replace("April 02, 2026", "April 01, 2026").replace("biorxiv", "medrxiv")
+
+    monkeypatch.setattr("frontier_compass.ingest.medrxiv.fetch_text", fake_fetch_text)
+
+    client = MedRxivClient()
+
+    with pytest.raises(FeedRequestError, match="only exposes 2026-04-01"):
+        client.fetch_today_with_timings(today=date(2026, 4, 2))

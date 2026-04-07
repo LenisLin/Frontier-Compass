@@ -53,8 +53,8 @@ def test_build_daily_brief_summarizes_shown_papers_and_signals() -> None:
     assert brief.top_keyword_signals[0].label == "genomics"
     assert {signal.label for signal in brief.top_keyword_signals} >= {"genomics", "transcriptomics"}
     assert len(brief.takeaways) == 4
-    assert brief.takeaways[0].startswith("Showing 2 of 3 ranked papers in the current view")
-    assert brief.takeaways[1].startswith("Visible themes in this view")
+    assert brief.takeaways[0].startswith("Digest shortlist shows 2 of 3 ranked papers for this run")
+    assert brief.takeaways[1].startswith("Repeated themes in the shortlist")
     assert GENOMICS_THEME in brief.takeaways[3]
 
 

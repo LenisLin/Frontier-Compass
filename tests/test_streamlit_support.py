@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import replace
 from datetime import date, datetime, timezone
+import json
 from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
 
 from streamlit.testing.v1 import AppTest
 
 from frontier_compass.api import DailyRunResult, FrontierCompassRunner, LocalUISession
 from frontier_compass.common.frontier_report import build_daily_frontier_report
-from frontier_compass.storage.schema import (
-    DailyDigest,
-    PaperRecord,
-    RankedPaper,
-    RunHistoryEntry,
-    RunTimings,
-    SourceRunStats,
+from frontier_compass.storage.schema import DailyDigest, PaperRecord, RankedPaper, RunHistoryEntry, RunTimings, SourceRunStats
+from frontier_compass.ui import BIOMEDICAL_LATEST_MODE, FrontierCompassApp
+from frontier_compass.ui.streamlit_app import (
+    _build_zero_result_guidance,
+    _build_personalization_state,
+    _load_startup_request,
+    _persist_uploaded_zotero_export,
+    _render_frontier_highlights,
 )
-from frontier_compass.ui import BIOMEDICAL_LATEST_MODE, BIOMEDICAL_MULTISOURCE_MODE, FrontierCompassApp
-from frontier_compass.ui.streamlit_app import _load_startup_request
+from frontier_compass.ui.app import DEFAULT_REVIEWER_SOURCE
 from frontier_compass.ui.streamlit_support import render_external_link
 
 
@@ -68,6 +70,48 @@ class _TypeErrorStreamlit(_RecordingStreamlit):
         use_container_width: bool | None = None,
     ) -> str:
         raise TypeError("unexpected optional keyword")
+
+
+class _UploadedExport:
+    def __init__(self, name: str, payload: bytes) -> None:
+        self.name = name
+        self._payload = payload
+
+    def getvalue(self) -> bytes:
+        return self._payload
+
+
+class _ContainerContext:
+    def __enter__(self):
+        return None
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        del exc_type, exc, tb
+        return False
+
+
+class _HighlightStreamlit:
+    def __init__(self) -> None:
+        self.markdown_calls: list[tuple[str, bool]] = []
+        self.write_calls: list[str] = []
+        self.caption_calls: list[str] = []
+        self.info_calls: list[str] = []
+
+    def container(self, *, border: bool = False) -> _ContainerContext:
+        del border
+        return _ContainerContext()
+
+    def markdown(self, body: str, *, unsafe_allow_html: bool = False) -> None:
+        self.markdown_calls.append((body, unsafe_allow_html))
+
+    def write(self, body: str) -> None:
+        self.write_calls.append(body)
+
+    def caption(self, body: str) -> None:
+        self.caption_calls.append(body)
+
+    def info(self, body: str) -> None:
+        self.info_calls.append(body)
 
 
 def test_render_external_link_drops_unsupported_kwargs(monkeypatch) -> None:
@@ -127,7 +171,7 @@ def test_render_external_link_falls_back_after_type_error(monkeypatch) -> None:
     ]
 
 
-def test_load_startup_request_derives_range_and_zotero_profile_from_paths() -> None:
+def test_load_startup_request_derives_range_and_live_zotero_from_explicit_db_path() -> None:
     request = _load_startup_request(
         [
             "--source",
@@ -145,71 +189,220 @@ def test_load_startup_request_derives_range_and_zotero_profile_from_paths() -> N
 
     assert request.selected_source == "biomedical-multisource"
     assert request.fetch_scope == "range-full"
-    assert request.effective_profile_source == "zotero"
+    assert request.effective_profile_source == "live_zotero_db"
     assert request.request_label == "2026-03-20 -> 2026-03-24"
-    assert "Zotero is auto-selected because a local Zotero library is available." == request.auto_profile_source_note
+    assert request.auto_profile_source_note == "Personalization defaults to the configured live Zotero DB."
 
 
-def test_load_startup_request_reorders_inverted_range_dates() -> None:
+def test_load_startup_request_collapses_equal_start_and_end_dates_to_single_day() -> None:
     request = _load_startup_request(
         [
-            "--source",
-            "biomedical-multisource",
             "--requested-date",
             "2026-03-24",
             "--start-date",
             "2026-03-24",
             "--end-date",
-            "2026-03-20",
+            "2026-03-24",
         ]
     )
 
-    assert request.fetch_scope == "range-full"
-    assert request.requested_date == date(2026, 3, 20)
-    assert request.start_date == date(2026, 3, 20)
-    assert request.end_date == date(2026, 3, 24)
-    assert request.request_label == "2026-03-20 -> 2026-03-24"
+    assert request.requested_date == date(2026, 3, 24)
+    assert request.start_date is None
+    assert request.end_date is None
+    assert request.fetch_scope == "day-full"
+    assert request.request_label == "2026-03-24"
 
 
-def test_render_external_link_ignores_empty_urls(monkeypatch) -> None:
-    recorder = _RecordingStreamlit()
-    monkeypatch.setattr("frontier_compass.ui.streamlit_support.st", recorder)
+def test_build_zero_result_guidance_explains_empty_default_bundle() -> None:
+    ranked: list[RankedPaper] = []
+    digest = DailyDigest(
+        source="multisource",
+        category="biomedical",
+        target_date=date(2026, 4, 3),
+        generated_at=datetime(2026, 4, 3, 7, 15, tzinfo=timezone.utc),
+        feed_url="",
+        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        ranked=ranked,
+        frontier_report=build_daily_frontier_report(
+            paper_pool=[],
+            ranked_papers=[],
+            requested_date=date(2026, 4, 3),
+            effective_date=date(2026, 4, 3),
+            source="multisource",
+            mode="biomedical",
+            mode_label="Biomedical",
+            mode_kind="source-bundle",
+            total_fetched=0,
+        ),
+        source_run_stats=(
+            SourceRunStats(
+                source="arxiv",
+                fetched_count=0,
+                displayed_count=0,
+                status="empty",
+                outcome="live-zero",
+                note="The live category Atom feeds returned no same-day entries, so the snapshot reused the biomedical discovery API query fallback.",
+                timings=RunTimings(network_seconds=1.0, parse_seconds=0.1, total_seconds=1.1),
+            ),
+            SourceRunStats(
+                source="biorxiv",
+                fetched_count=0,
+                displayed_count=0,
+                status="empty",
+                outcome="live-zero",
+                note="Daily bioRxiv all-subject local snapshot.",
+                timings=RunTimings(network_seconds=0.5, parse_seconds=0.05, total_seconds=0.55),
+            ),
+        ),
+        total_fetched=0,
+        mode_label="Biomedical",
+        mode_kind="source-bundle",
+        requested_date=date(2026, 4, 3),
+        effective_date=date(2026, 4, 3),
+    )
+    session = LocalUISession(
+        current_run=DailyRunResult(
+            digest=digest,
+            cache_path=Path("data/cache/frontier_compass_bundle_biomedical_2026-04-03.json"),
+            report_path=Path("reports/daily/frontier_compass_bundle_biomedical_2026-04-03.html"),
+            display_source="freshly fetched",
+        )
+    )
 
-    rendered_as_button = render_external_link("Open report", "", use_container_width=True)
+    guidance = _build_zero_result_guidance(session, selected_source=DEFAULT_REVIEWER_SOURCE)
 
-    assert rendered_as_button is False
-    assert recorder.link_button_calls == []
-    assert recorder.markdown_calls == []
+    assert guidance[0] == "No papers matched 2026-04-03 in the current source contract."
+    assert "widen the Reading date range above" in guidance[1]
+    assert guidance[2].startswith("arXiv:")
+    assert "API query fallback" in guidance[2]
+    assert guidance[3].startswith("bioRxiv:")
 
 
-def test_load_startup_request_parses_cli_style_streamlit_args() -> None:
+def test_load_startup_request_uses_configured_live_zotero_db(monkeypatch, tmp_path: Path) -> None:
+    db_path = tmp_path / "zotero" / "zotero.sqlite"
+    db_path.parent.mkdir(parents=True)
+    _write_minimal_zotero_db(db_path)
+
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(
+        json.dumps({"default_zotero_db_path": "zotero/zotero.sqlite"}),
+        encoding="utf-8",
+    )
+
+    request = _load_startup_request(["--config", str(config_path)])
+
+    assert request.effective_profile_source == "live_zotero_db"
+    assert request.zotero_db_path == db_path
+    assert request.zotero_export_path is None
+
+
+def test_load_startup_request_falls_back_to_reusable_export_snapshot(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    export_path = tmp_path / "data" / "raw" / "zotero" / "library.csl.json"
+    export_path.parent.mkdir(parents=True)
+    export_path.write_text(_sample_export_payload(), encoding="utf-8")
+
+    request = _load_startup_request(["--no-config"])
+
+    assert request.effective_profile_source == "zotero_export"
+    assert request.zotero_export_path == Path("data/raw/zotero/library.csl.json")
+    assert request.zotero_db_path is None
+
+
+def test_load_startup_request_uses_configured_export_when_no_live_db(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    export_path = tmp_path / "exports" / "configured.csl.json"
+    export_path.parent.mkdir(parents=True)
+    export_path.write_text(_sample_export_payload(), encoding="utf-8")
+
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(
+        json.dumps({"default_zotero_export_path": "exports/configured.csl.json"}),
+        encoding="utf-8",
+    )
+
+    request = _load_startup_request(["--config", str(config_path)])
+
+    assert request.effective_profile_source == "zotero_export"
+    assert request.zotero_export_path == export_path
+    assert request.zotero_db_path is None
+
+
+def test_load_startup_request_defaults_to_baseline_without_zotero_defaults(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(json.dumps({}), encoding="utf-8")
+
+    request = _load_startup_request(["--config", str(config_path)])
+
+    assert request.effective_profile_source == "baseline"
+    assert request.zotero_export_path is None
+    assert request.zotero_db_path is None
+
+
+def test_load_startup_request_explicit_export_override_beats_configured_live_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "zotero" / "zotero.sqlite"
+    db_path.parent.mkdir(parents=True)
+    _write_minimal_zotero_db(db_path)
+
+    config_path = tmp_path / "user_defaults.json"
+    config_path.write_text(
+        json.dumps({"default_zotero_db_path": "zotero/zotero.sqlite"}),
+        encoding="utf-8",
+    )
+    override_export = tmp_path / "override.csl.json"
+    override_export.write_text(_sample_export_payload(), encoding="utf-8")
+
     request = _load_startup_request(
         [
-            "--source",
-            "cs.LG",
-            "--requested-date",
-            "2026-03-24",
-            "--max-results",
-            "60",
-            "--report-mode",
-            "enhanced",
+            "--config",
+            str(config_path),
             "--zotero-export",
-            "configs/sample.csl.json",
-            "--zotero-collection",
-            "Tumor microenvironment",
-            "--zotero-collection",
-            "Foundation models",
-            "--no-stale-cache",
+            str(override_export),
         ]
     )
 
-    assert request.selected_source == "cs.LG"
-    assert request.requested_date == date(2026, 3, 24)
-    assert request.max_results == 60
-    assert request.report_mode == "enhanced"
-    assert request.zotero_export_path == Path("configs/sample.csl.json")
-    assert request.zotero_collections == ("Tumor microenvironment", "Foundation models")
-    assert request.allow_stale_cache is False
+    assert request.effective_profile_source == "zotero_export"
+    assert request.zotero_export_path == override_export
+    assert request.zotero_db_path is None
+
+
+def test_build_personalization_state_reads_configured_live_db(tmp_path: Path) -> None:
+    db_path = tmp_path / "zotero.sqlite"
+    _write_minimal_zotero_db(db_path)
+
+    request = _load_startup_request(["--zotero-db-path", str(db_path)])
+    state = _build_personalization_state(request)
+
+    assert state.active is True
+    assert state.profile_source == "live_zotero_db"
+    assert state.available_collections == ("Tumor microenvironment",)
+    assert state.item_count == 1
+
+
+def test_persist_uploaded_zotero_export_creates_reusable_snapshot_and_collections(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    app = FrontierCompassApp(
+        zotero_export_path=tmp_path / "data" / "raw" / "zotero" / "library.csl.json",
+        zotero_status_path=tmp_path / "data" / "raw" / "zotero" / "library_status.json",
+    )
+    runner = FrontierCompassRunner(app=app)
+
+    state = _persist_uploaded_zotero_export(
+        runner,
+        _UploadedExport("library.csl.json", _sample_export_payload().encode("utf-8")),
+    )
+
+    assert state.ready is True
+    assert state.export_path.exists()
+    assert state.collections == ("Tumor microenvironment", "Foundation models")
+
+    request = _load_startup_request(["--no-config"])
+    personalization_state = _build_personalization_state(request)
+
+    assert request.effective_profile_source == "zotero_export"
+    assert personalization_state.active is True
+    assert personalization_state.available_collections == ("Tumor microenvironment", "Foundation models")
 
 
 def test_load_startup_request_parses_skip_initial_load_flag() -> None:
@@ -226,58 +419,146 @@ def test_load_startup_request_parses_skip_initial_load_flag() -> None:
     assert request.skip_initial_load is True
 
 
-def test_streamlit_request_switching_stays_staged_until_apply(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_current.html"
-    report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_current.json"
-    cache_path.write_text("{}", encoding="utf-8")
+def test_streamlit_homepage_is_reading_first_single_page(monkeypatch, tmp_path: Path) -> None:
+    session = _sample_ui_session(tmp_path, requested_date=date(2026, 3, 24))
+
+    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        del kwargs
+        return session
+
+    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
+
+    at = AppTest.from_file(str(_app_path()))
+    at.run(timeout=15)
+
+    assert len(at.exception) == 0
+    assert len(at.tabs) == 3
+    assert any("## Daily Full Report" in item.value for item in at.markdown)
+    assert any("## Most Relevant to Your Zotero" in item.value for item in at.markdown)
+    assert any("## Other Frontier Signals" in item.value for item in at.markdown)
+    assert any(expander.label == "Advanced compatibility" for expander in at.expander)
+    assert any(expander.label == "Personalization" for expander in at.expander)
+    assert any(expander.label == "Full ranked pool" for expander in at.expander)
+    assert any(expander.label == "History and provenance" for expander in at.expander)
+    assert any(expander.label == "Runtime and compatibility" for expander in at.expander)
+    assert _button(at, "Refresh").label == "Refresh"
+
+
+def test_render_frontier_highlights_renders_source_link_when_available(monkeypatch) -> None:
+    recorder = _HighlightStreamlit()
+    link_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    def fake_render_external_link(label: str, url: str, **kwargs) -> bool:
+        link_calls.append((label, url, kwargs))
+        return True
+
+    monkeypatch.setattr("frontier_compass.ui.streamlit_app.st", recorder)
+    monkeypatch.setattr("frontier_compass.ui.streamlit_app.render_external_link", fake_render_external_link)
+
+    _render_frontier_highlights(
+        (
+            SimpleNamespace(
+                title="Frontier fixture",
+                source="biorxiv",
+                theme_label="single-cell systems",
+                published=date(2026, 3, 24),
+                why="Shows a sharp methods crossover.",
+                summary="A readable highlight summary.",
+                url="https://www.biorxiv.org/content/10.1101/2026.03.24.000001v1",
+            ),
+        )
+    )
+
+    assert any("### 1. Frontier fixture" in body for body, _ in recorder.markdown_calls)
+    assert any("bioRxiv" in body and "single-cell systems" in body for body, _ in recorder.markdown_calls)
+    assert recorder.write_calls == ["A readable highlight summary."]
+    assert link_calls == [
+        (
+            "Open source paper",
+            "https://www.biorxiv.org/content/10.1101/2026.03.24.000001v1",
+            {
+                "key": "frontier-highlight-link-frontier-fixture",
+                "use_container_width": True,
+            },
+        )
+    ]
+
+
+def test_render_frontier_highlights_shows_missing_link_caption(monkeypatch) -> None:
+    recorder = _HighlightStreamlit()
+
+    def fail_render_external_link(*args, **kwargs) -> bool:
+        del args, kwargs
+        raise AssertionError("render_external_link should not be called")
+
+    monkeypatch.setattr("frontier_compass.ui.streamlit_app.st", recorder)
+    monkeypatch.setattr("frontier_compass.ui.streamlit_app.render_external_link", fail_render_external_link)
+
+    _render_frontier_highlights(
+        (
+            SimpleNamespace(
+                title="Unlinked frontier fixture",
+                source="arxiv",
+                theme_label="diagnostics",
+                published=date(2026, 3, 24),
+                why="Missing source url fixture.",
+                summary="No URL on purpose.",
+                url="",
+            ),
+        )
+    )
+
+    assert recorder.caption_calls == ["No source link is attached to this highlight."]
+
+
+def test_streamlit_date_change_auto_loads_cache_first_and_refresh_forces_fetch(monkeypatch, tmp_path: Path) -> None:
     calls: list[dict[str, object]] = []
 
     def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
         assert isinstance(self, FrontierCompassRunner)
         calls.append(dict(kwargs))
-        requested_source = str(kwargs["source"])
         requested_date = kwargs["requested_date"]
         assert isinstance(requested_date, date)
-        digest = DailyDigest(
-            source="multisource" if requested_source == "ai-for-medicine" else "arxiv",
-            category=requested_source,
-            target_date=requested_date,
-            generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-            feed_url="https://export.arxiv.org/api/query",
-            profile=FrontierCompassApp.daily_profile(requested_source),
-            ranked=[],
-            frontier_report=_frontier_report_for([], requested_date=requested_date, effective_date=requested_date),
-            requested_date=requested_date,
-            effective_date=requested_date,
-            mode_label=requested_source,
-            mode_kind="source-bundle" if requested_source == "ai-for-medicine" else "source-bundle",
-        )
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-        )
+        return _sample_ui_session(tmp_path, requested_date=requested_date)
 
     monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
 
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
+    at = AppTest.from_file(str(_app_path()))
     at.run(timeout=15)
 
     assert len(calls) == 1
     assert calls[0]["refresh"] is False
 
-    assert _selectbox(at, "Source bundle", key="fc-launch-source-bundle").key == "fc-launch-source-bundle"
-    assert _radio(at, "Time scope", key="fc-launch-time-scope").key == "fc-launch-time-scope"
-    _selectbox(at, "Source bundle", key="fc-launch-source-bundle").select("ai-for-medicine")
+    _date_input(at, "Reading date", key="fc-home-requested-date").set_value((date(2026, 3, 25), date(2026, 3, 25)))
     at.run(timeout=15)
 
-    assert len(calls) == 1
-    assert any("Launcher choices are staged." in item.value for item in at.info)
+    assert len(calls) == 2
+    assert calls[-1]["requested_date"] == date(2026, 3, 25)
+    assert calls[-1]["refresh"] is False
 
-    _button(at, "Daily Recommendation").click()
+    _button(at, "Refresh").click()
+    at.run(timeout=15)
+
+    assert len(calls) == 3
+    assert calls[-1]["requested_date"] == date(2026, 3, 25)
+    assert calls[-1]["refresh"] is True
+
+
+def test_streamlit_advanced_source_override_auto_loads_without_apply(monkeypatch, tmp_path: Path) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
+        assert isinstance(self, FrontierCompassRunner)
+        calls.append(dict(kwargs))
+        return _sample_ui_session(tmp_path, requested_date=kwargs["requested_date"], source=str(kwargs["source"]))
+
+    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
+
+    at = AppTest.from_file(str(_app_path()))
+    at.run(timeout=15)
+
+    _selectbox(at, "Source override", key="fc-advanced-source-bundle").select("ai-for-medicine")
     at.run(timeout=15)
 
     assert len(calls) == 2
@@ -285,18 +566,22 @@ def test_streamlit_request_switching_stays_staged_until_apply(monkeypatch, tmp_p
     assert calls[-1]["refresh"] is False
 
 
-def test_streamlit_app_renders_link_actions_without_runtime_exception(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
+def _app_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
+
+
+def _sample_ui_session(tmp_path: Path, *, requested_date: date, source: str = BIOMEDICAL_LATEST_MODE) -> LocalUISession:
+    report_path = tmp_path / f"{source}_{requested_date.isoformat()}.html"
     report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
+    cache_path = tmp_path / f"{source}_{requested_date.isoformat()}.json"
     cache_path.write_text("{}", encoding="utf-8")
     digest = DailyDigest(
         source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
+        category=source,
+        target_date=requested_date,
         generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
         feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
+        profile=FrontierCompassApp.daily_profile(source),
         ranked=[
             RankedPaper(
                 paper=PaperRecord(
@@ -306,7 +591,7 @@ def test_streamlit_app_renders_link_actions_without_runtime_exception(monkeypatc
                     summary="Atlas integration for transcriptomics and proteomics.",
                     authors=("A Researcher", "B Collaborator"),
                     categories=("q-bio.GN", "q-bio.QM"),
-                    published=date(2026, 3, 24),
+                    published=requested_date,
                     url="https://arxiv.org/abs/2603.20001",
                 ),
                 score=0.88,
@@ -317,223 +602,20 @@ def test_streamlit_app_renders_link_actions_without_runtime_exception(monkeypatc
                 recommendation_summary="Strong biomedical match for reviewer triage.",
             ),
         ],
-        frontier_report=_frontier_report_for(
-            [
-                RankedPaper(
-                    paper=PaperRecord(
-                        source="arxiv",
-                        identifier="2603.20001v1",
-                        title="Single-cell atlas alignment with multimodal omics",
-                        summary="Atlas integration for transcriptomics and proteomics.",
-                        authors=("A Researcher", "B Collaborator"),
-                        categories=("q-bio.GN", "q-bio.QM"),
-                        published=date(2026, 3, 24),
-                        url="https://arxiv.org/abs/2603.20001",
-                    ),
-                    score=0.88,
-                    reasons=(
-                        "biomedical evidence: transcriptomics, proteomics",
-                        "topic match: q-bio, q-bio.gn",
-                    ),
-                    recommendation_summary="Strong biomedical match for reviewer triage.",
-                )
-            ],
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-        ),
-        searched_categories=("q-bio", "q-bio.GN", "cs.CV"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.CV": 1},
-        total_fetched=1,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        mode_notes="Hybrid biomedical reviewer mode using the fixed q-bio bundle plus fixed broader arXiv API searches.",
-        search_profile_label="broader-biomedical-discovery-v1",
-        search_queries=(
-            "((cat:q-bio OR cat:cs.CV) AND (all:biomedical OR all:medical OR all:clinical OR all:pathology))",
-        ),
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    assert [tab.label for tab in at.tabs] == ["Digest", "Frontier Report", "History"]
-    assert any("## Personalized Digest" in item.value for item in at.markdown)
-    assert any("## Frontier Report" in item.value for item in at.markdown)
-    assert any("## History" in item.value for item in at.markdown)
-    assert any("Top recommendations" in item.value for item in at.markdown)
-    assert any("Repeated themes" in item.value for item in at.markdown)
-    assert any("genomics / transcriptomics / single-cell" in item.value for item in at.markdown)
-    assert any("Why it surfaced" in item.value for item in at.markdown)
-    assert any(getattr(item, "label", "") == "Score details" for item in at.expander)
-    assert _expander(at, "Request window").proto.expanded is False
-    assert _expander(at, "Custom bundles").proto.expanded is False
-    assert _expander(at, "Full run details").proto.expanded is False
-    assert _expander(at, "Run details and provenance").proto.expanded is False
-    assert any("Status: fresh source fetch." in item.value for item in at.success)
-    assert any("Profile source" in item.label for item in at.metric)
-    assert any(
-        item.value.startswith("Source mix: ")
-        and "arXiv" in item.value
-        and "bioRxiv" in item.value
-        for item in at.caption
-    )
-    assert any("Active profile basis:" in item.value for item in at.caption)
-    link_labels = [item.proto.label for item in at if getattr(item, "type", "") == "link_button"]
-    assert "Open current HTML report" in link_labels
-    assert "Open current cache JSON" in link_labels
-    assert "Open top arXiv abstract" in link_labels
-    assert "Open arXiv abstract" in link_labels
-    assert any("Session briefing" in item.value for item in at.markdown)
-    assert _button(at, "Daily Recommendation").label == "Daily Recommendation"
-    assert _button(at, "Daily Report").label == "Daily Report"
-
-
-def test_streamlit_app_hides_missing_current_artifacts(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "missing_frontier_report.html"
-    cache_path = tmp_path / "missing_frontier_cache.json"
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[
-            RankedPaper(
-                paper=PaperRecord(
-                    source="arxiv",
-                    identifier="2603.20001v1",
-                    title="Single-cell atlas alignment with multimodal omics",
-                    summary="Atlas integration for transcriptomics and proteomics.",
-                    authors=("A Researcher",),
-                    categories=("q-bio.GN",),
-                    published=date(2026, 3, 24),
-                    url="https://arxiv.org/abs/2603.20001",
-                ),
-                score=0.88,
-                recommendation_summary="Strong biomedical match for reviewer triage.",
-            ),
-        ],
-        frontier_report=_frontier_report_for(
-            [
-                RankedPaper(
-                    paper=PaperRecord(
-                        source="arxiv",
-                        identifier="2603.20001v1",
-                        title="Single-cell atlas alignment with multimodal omics",
-                        summary="Atlas integration for transcriptomics and proteomics.",
-                        authors=("A Researcher",),
-                        categories=("q-bio.GN",),
-                        published=date(2026, 3, 24),
-                        url="https://arxiv.org/abs/2603.20001",
-                    ),
-                    score=0.88,
-                    recommendation_summary="Strong biomedical match for reviewer triage.",
-                )
-            ],
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-        ),
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-    )
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    link_labels = [item.proto.label for item in at if getattr(item, "type", "") == "link_button"]
-    assert "Open current HTML report" not in link_labels
-    assert "Open current cache JSON" not in link_labels
-    assert any("Current HTML report is missing for this run." in item.value for item in at.caption)
-    assert any("Report missing" in item.value for item in at.caption)
-    assert any("Cache missing" in item.value for item in at.caption)
-
-
-def test_streamlit_app_renders_empty_state_when_session_load_fails(monkeypatch) -> None:
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        raise RuntimeError("arXiv request failed with HTTP 429 Too Many Requests")
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    assert [tab.label for tab in at.tabs] == ["Digest", "Frontier Report", "History"]
-    assert any("Unable to load a reviewer digest" in item.value for item in at.error)
-    assert any("No digest is loaded yet." in item.value for item in at.markdown)
-    assert any("No frontier report is available yet." in item.value for item in at.markdown)
-    assert any("Startup note." in item.value for item in at.markdown)
-
-
-def test_streamlit_app_renders_recent_runs_history_section(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
-    report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    eml_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.eml"
-    eml_path.write_text("dry-run email", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    cache_path.write_text("{}", encoding="utf-8")
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[
-            RankedPaper(
-                paper=PaperRecord(
+        frontier_report=build_daily_frontier_report(
+            paper_pool=[
+                PaperRecord(
                     source="arxiv",
                     identifier="2603.20001v1",
                     title="Single-cell atlas alignment with multimodal omics",
                     summary="Atlas integration for transcriptomics and proteomics.",
                     authors=("A Researcher", "B Collaborator"),
                     categories=("q-bio.GN", "q-bio.QM"),
-                    published=date(2026, 3, 24),
+                    published=requested_date,
                     url="https://arxiv.org/abs/2603.20001",
-                ),
-                score=0.88,
-                recommendation_summary="Strong biomedical match for reviewer triage.",
-            ),
-        ],
-        frontier_report=_frontier_report_for(
-            [
+                )
+            ],
+            ranked_papers=[
                 RankedPaper(
                     paper=PaperRecord(
                         source="arxiv",
@@ -542,393 +624,137 @@ def test_streamlit_app_renders_recent_runs_history_section(monkeypatch, tmp_path
                         summary="Atlas integration for transcriptomics and proteomics.",
                         authors=("A Researcher", "B Collaborator"),
                         categories=("q-bio.GN", "q-bio.QM"),
-                        published=date(2026, 3, 24),
+                        published=requested_date,
                         url="https://arxiv.org/abs/2603.20001",
                     ),
                     score=0.88,
-                    reasons=(
-                        "biomedical evidence: transcriptomics, proteomics",
-                        "topic match: q-bio, q-bio.gn",
-                    ),
+                    reasons=("signal",),
                     recommendation_summary="Strong biomedical match for reviewer triage.",
                 )
             ],
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-        ),
-        searched_categories=("q-bio", "q-bio.GN", "cs.CV"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.CV": 1},
-        total_fetched=1,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
-    recent_runs = [
-        RunHistoryEntry(
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-            category=BIOMEDICAL_LATEST_MODE,
-            mode_label="Biomedical latest available",
-            mode_kind="latest-available-hybrid",
-            profile_basis="biomedical baseline",
-            zotero_export_name="sample_library.csl.json",
-            fetch_status="fresh source fetch",
-            same_date_cache_reused=False,
-            stale_cache_fallback_used=False,
-            ranked_count=1,
-            exploration_pick_count=1,
-            cache_path=str(cache_path),
-            report_path=str(report_path),
-            eml_path=str(eml_path),
-            generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        )
-    ]
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-            recent_history=recent_runs,
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    link_labels = [item.proto.label for item in at if getattr(item, "type", "") == "link_button"]
-    assert "Open recent report" in link_labels
-    assert "Open recent cache" in link_labels
-    assert "Open recent .eml" in link_labels
-
-
-def test_streamlit_frontier_tab_shows_source_mix_and_timings(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_multisource_biomedical-multisource_2026-03-24.html"
-    report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_multisource_biomedical-multisource_2026-03-24.json"
-    cache_path.write_text("{}", encoding="utf-8")
-    ranked = [
-        RankedPaper(
-            paper=PaperRecord(
-                source="arxiv",
-                identifier="2603.24001v1",
-                title="Frontier source mix fixture",
-                summary="Frontier source mix fixture.",
-                authors=("A Researcher",),
-                categories=("q-bio.GN",),
-                published=date(2026, 3, 24),
-                url="https://arxiv.org/abs/2603.24001",
-            ),
-            score=0.88,
-            recommendation_summary="Source mix fixture.",
-        )
-    ]
-    source_run_stats = (
-        SourceRunStats(
+            requested_date=requested_date,
+            effective_date=requested_date,
             source="arxiv",
-            fetched_count=1,
-            displayed_count=1,
-            status="ready",
-            cache_status="fresh",
-            timings=RunTimings(network_seconds=0.8, parse_seconds=0.2, total_seconds=1.0),
-        ),
-        SourceRunStats(
-            source="biorxiv",
-            fetched_count=0,
-            displayed_count=0,
-            status="empty",
-            cache_status="fresh",
-            timings=RunTimings(network_seconds=0.1, total_seconds=0.1),
-        ),
-        SourceRunStats(
-            source="medrxiv",
-            fetched_count=0,
-            displayed_count=0,
-            status="failed",
-            cache_status="same-day-cache",
-            error="medRxiv unavailable",
-            timings=RunTimings(network_seconds=0.2, total_seconds=0.2),
-        ),
-    )
-    frontier_report = replace(
-        build_daily_frontier_report(
-            paper_pool=[item.paper for item in ranked],
-            ranked_papers=ranked,
-            requested_date=date(2026, 3, 24),
-            effective_date=date(2026, 3, 24),
-            source="multisource",
-            mode=BIOMEDICAL_MULTISOURCE_MODE,
-            mode_label="Biomedical multisource",
-            mode_kind="multisource",
+            mode=source,
+            mode_label=source,
             total_fetched=1,
         ),
-        source_run_stats=source_run_stats,
-        run_timings=RunTimings(
-            network_seconds=1.1,
-            parse_seconds=0.2,
-            rank_seconds=0.3,
-            report_seconds=0.4,
-            total_seconds=2.0,
-        ),
-        report_status="partial",
-        report_error="medRxiv unavailable",
-        source_counts={"arxiv": 1, "biorxiv": 0, "medrxiv": 0},
+        searched_categories=("q-bio", "q-bio.GN"),
+        per_category_counts={"q-bio": 1, "q-bio.GN": 1},
+        total_fetched=1,
+        mode_label=source,
+        mode_kind="source-bundle",
+        requested_date=requested_date,
+        effective_date=requested_date,
     )
-    digest = DailyDigest(
-        source="multisource",
-        category=BIOMEDICAL_MULTISOURCE_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        feed_url="",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_MULTISOURCE_MODE),
-        ranked=ranked,
-        frontier_report=frontier_report,
-        source_run_stats=source_run_stats,
-        run_timings=frontier_report.run_timings,
-        source_counts={"arxiv": 1, "biorxiv": 0, "medrxiv": 0},
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-        mode_label="Biomedical multisource",
-        mode_kind="multisource",
-        report_status="partial",
-        report_error="medRxiv unavailable",
-    )
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
+    return LocalUISession(
+        current_run=DailyRunResult(
             digest=digest,
             cache_path=cache_path,
             report_path=report_path,
             display_source="freshly fetched",
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    assert any("Source mix: arXiv 1 shown / 1 fetched, bioRxiv 0 shown / 0 fetched, medRxiv 0 shown / 0 fetched" in item.value for item in at.caption)
-    assert any("Source stats: arXiv fetched 1 / retained 1 [live-success; ready; fresh]" in item.value for item in at.caption)
-    assert any("bioRxiv fetched 0 / retained 0 [live-zero; empty; fresh]" in item.value for item in at.caption)
-    assert any("medRxiv fetched 0 / retained 0 [unknown-legacy; failed; same-day-cache]" in item.value for item in at.caption)
-    assert any("Current fetch status: fresh source fetch." in item.value for item in at.caption)
-    assert any("Run timings: network 1.10s | parse 0.20s | rank 0.30s | report 0.40s | total 2.00s" in item.value for item in at.caption)
-    assert any("Report availability in this session: yes." in item.value for item in at.caption)
-    assert any("Report note: medRxiv unavailable" in item.value for item in at.caption)
-
-
-def test_streamlit_top_recommendations_stay_score_first_when_full_list_sorts_newest(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
-    report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    cache_path.write_text("{}", encoding="utf-8")
-
-    imaging_lead = "Sparse Autoencoders for Medical Imaging"
-    imaging_second = "Radiology Distillation for CT Cohorts"
-    genomics_title = "Single-cell Transcriptomics Atlas Integration"
-    pathology_title = "Whole-slide Histopathology Reasoning"
-
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[
-            _ranked_paper(
-                identifier="2603.21001v1",
-                title=imaging_lead,
-                summary="Medical imaging workflow for MRI and CT review.",
-                categories=("cs.CV",),
-                published=date(2026, 3, 20),
-                score=0.91,
-            ),
-            _ranked_paper(
-                identifier="2603.21002v1",
-                title=imaging_second,
-                summary="Radiology and CT pipeline for medical imaging.",
-                categories=("cs.CV",),
-                published=date(2026, 3, 20),
-                score=0.9,
-            ),
-            _ranked_paper(
-                identifier="2603.21003v1",
-                title="Zero-shot Chest Scan Segmentation",
-                summary="Medical imaging benchmark for chest scan segmentation.",
-                categories=("cs.CV",),
-                published=date(2026, 3, 20),
-                score=0.89,
-            ),
-            _ranked_paper(
-                identifier="2603.21004v1",
-                title=genomics_title,
-                summary="Genomics and transcriptomics workflow for a single-cell atlas.",
-                categories=("q-bio.GN", "cs.LG"),
-                published=date(2026, 3, 24),
-                score=0.88,
-            ),
-            _ranked_paper(
-                identifier="2603.21005v1",
-                title=pathology_title,
-                summary="Pathology and whole-slide microscopy pipeline for diagnostics.",
-                categories=("cs.CV",),
-                published=date(2026, 3, 24),
-                score=0.87,
-            ),
-        ],
-        searched_categories=("q-bio", "q-bio.GN", "cs.CV", "cs.LG"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.CV": 4, "cs.LG": 1},
-        total_fetched=6,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-    assert _selectbox(at, "Sort order", key="fc-digest-sort-order").key == "fc-digest-sort-order"
-    _selectbox(at, "Sort order", key="fc-digest-sort-order").select("Newest first")
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-
-    title_positions = {
-        title: next(i for i, item in enumerate(at.markdown) if title in item.value)
-        for title in (imaging_lead, imaging_second, genomics_title, pathology_title)
-    }
-    full_titles = [
-        item.value
-        for item in at.markdown
-        if item.value.startswith("### ")
-        and any(title in item.value for title in (imaging_lead, imaging_second, genomics_title, pathology_title))
-    ]
-
-    assert title_positions[imaging_lead] < title_positions[imaging_second] < title_positions[genomics_title] < title_positions[pathology_title]
-    assert genomics_title in full_titles[0]
-    assert pathology_title in full_titles[1]
-    assert imaging_lead in full_titles[2]
-
-
-def test_streamlit_app_renders_exploration_section(monkeypatch, tmp_path: Path) -> None:
-    report_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.html"
-    report_path.write_text("<html><body>report</body></html>", encoding="utf-8")
-    cache_path = tmp_path / "frontier_compass_arxiv_biomedical-latest_2026-03-24.json"
-    cache_path.write_text("{}", encoding="utf-8")
-    exploration_pick = _ranked_paper(
-        identifier="2603.21109v1",
-        title="Exploration lane microscopy fixture",
-        summary="Microscopy-led exploration fixture outside the main shortlist.",
-        categories=("cs.CV", "cs.AI"),
-        published=date(2026, 3, 24),
-        score=0.41,
-    )
-    digest = DailyDigest(
-        source="arxiv",
-        category=BIOMEDICAL_LATEST_MODE,
-        target_date=date(2026, 3, 24),
-        generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
-        feed_url="https://export.arxiv.org/api/query",
-        profile=FrontierCompassApp.daily_profile(BIOMEDICAL_LATEST_MODE),
-        ranked=[
-            _ranked_paper(identifier="2603.21001v1", title="Sparse Autoencoders for Medical Imaging", summary="Medical imaging workflow for MRI and CT review.", categories=("cs.CV",), published=date(2026, 3, 20), score=0.91),
-            _ranked_paper(identifier="2603.21002v1", title="Radiology Distillation for CT Cohorts", summary="Radiology and CT pipeline for medical imaging.", categories=("cs.CV",), published=date(2026, 3, 20), score=0.90),
-            _ranked_paper(identifier="2603.21003v1", title="Whole-slide Histopathology Reasoning", summary="Pathology and whole-slide microscopy pipeline for diagnostics.", categories=("cs.CV",), published=date(2026, 3, 24), score=0.89),
-            _ranked_paper(identifier="2603.21004v1", title="Single-cell Transcriptomics Atlas Integration", summary="Genomics and transcriptomics workflow for a single-cell atlas.", categories=("q-bio.GN", "cs.LG"), published=date(2026, 3, 24), score=0.88),
-            _ranked_paper(identifier="2603.21005v1", title="Clinical Tabular Learning for EHR Cohorts", summary="Clinical tabular modeling over patient cohorts.", categories=("cs.LG",), published=date(2026, 3, 24), score=0.87),
-            _ranked_paper(identifier="2603.21006v1", title="Protein Structure Priors for Biomolecular Discovery", summary="Protein biomolecular priors for therapeutic discovery.", categories=("q-bio.BM", "cs.LG"), published=date(2026, 3, 24), score=0.86),
-            _ranked_paper(identifier="2603.21007v1", title="General Biomedical Modeling Notes", summary="Biomedical methods for translational studies.", categories=("q-bio.QM",), published=date(2026, 3, 24), score=0.85),
-            _ranked_paper(identifier="2603.21008v1", title="Microscopy-guided Pathology Segmentation", summary="Microscopy and pathology segmentation for whole-slide review.", categories=("cs.CV",), published=date(2026, 3, 24), score=0.84),
-            exploration_pick,
-        ],
-        exploration_picks=[exploration_pick],
-        searched_categories=("q-bio", "q-bio.GN", "cs.CV", "cs.LG"),
-        per_category_counts={"q-bio": 1, "q-bio.GN": 1, "cs.CV": 5, "cs.LG": 3},
-        total_fetched=9,
-        feed_urls={"q-bio": "https://rss.arxiv.org/atom/q-bio"},
-        mode_label="Biomedical latest available",
-        mode_kind="latest-available-hybrid",
-        requested_date=date(2026, 3, 24),
-        effective_date=date(2026, 3, 24),
-    )
-
-    def fake_prepare_ui_session(self, **kwargs):  # type: ignore[no-untyped-def]
-        assert isinstance(self, FrontierCompassRunner)
-        del kwargs
-        return _local_ui_session(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source="freshly fetched",
-        )
-
-    monkeypatch.setattr(FrontierCompassRunner, "prepare_ui_session", fake_prepare_ui_session)
-
-    app_path = Path(__file__).resolve().parents[1] / "src" / "frontier_compass" / "ui" / "streamlit_app.py"
-    at = AppTest.from_file(str(app_path))
-    at.run(timeout=15)
-
-    assert len(at.exception) == 0
-    assert any("## Exploration" in item.value for item in at.markdown)
-    assert any("Why it's exploratory" in item.value for item in at.markdown)
-    assert any("Exploration lane microscopy fixture" in item.value for item in at.markdown)
-
-
-def _ranked_paper(
-    *,
-    identifier: str,
-    title: str,
-    summary: str,
-    categories: tuple[str, ...],
-    published: date,
-    score: float,
-) -> RankedPaper:
-    return RankedPaper(
-        paper=PaperRecord(
-            source="arxiv",
-            identifier=identifier,
-            title=title,
-            summary=summary,
-            authors=("A Researcher", "B Collaborator"),
-            categories=categories,
-            published=published,
-            updated=published,
-            url=f"https://arxiv.org/abs/{identifier.split('v', 1)[0]}",
+            fetch_status_label="fresh source fetch",
+            artifact_source_label="fresh source fetch",
         ),
-        score=score,
-        reasons=(
-            "biomedical evidence: matched deterministic test fixture",
-            "topic match: reviewer shortlist contract",
+        recent_history=(
+            RunHistoryEntry(
+                requested_date=requested_date,
+                effective_date=requested_date,
+                category=source,
+                mode_label=source,
+                mode_kind="source-bundle",
+                profile_basis="biomedical baseline",
+                fetch_status="fresh source fetch",
+                ranked_count=1,
+                cache_path=str(cache_path),
+                report_path=str(report_path),
+                generated_at=datetime(2026, 3, 24, 7, 15, tzinfo=timezone.utc),
+            ),
         ),
-        recommendation_summary="Deterministic streamlit reviewer contract fixture.",
     )
+
+
+def _sample_export_payload() -> str:
+    return json.dumps(
+        [
+            {
+                "title": "Spatial Transcriptomics Atlas",
+                "abstractNote": "Tumor microenvironment analysis.",
+                "keywords": ["spatial transcriptomics", "digital pathology"],
+                "collections": ["Tumor microenvironment"],
+                "dateAdded": "2026-03-25",
+            },
+            {
+                "title": "Foundation models for biology",
+                "abstractNote": "Foundation model reading list.",
+                "keywords": ["foundation models"],
+                "collections": ["Foundation models"],
+                "dateAdded": "2026-03-26",
+            },
+        ]
+    )
+
+
+def _write_minimal_zotero_db(path: Path) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE items (
+                itemID INTEGER PRIMARY KEY,
+                dateAdded TEXT,
+                itemTypeID INTEGER
+            );
+            CREATE TABLE deletedItems (itemID INTEGER);
+            CREATE TABLE itemTypes (itemTypeID INTEGER PRIMARY KEY, typeName TEXT);
+            CREATE TABLE fields (fieldID INTEGER PRIMARY KEY, fieldName TEXT);
+            CREATE TABLE itemData (itemID INTEGER, fieldID INTEGER, valueID INTEGER);
+            CREATE TABLE itemDataValues (valueID INTEGER PRIMARY KEY, value TEXT);
+            CREATE TABLE tags (tagID INTEGER PRIMARY KEY, name TEXT);
+            CREATE TABLE itemTags (itemID INTEGER, tagID INTEGER);
+            CREATE TABLE collections (collectionID INTEGER PRIMARY KEY, collectionName TEXT);
+            CREATE TABLE collectionItems (collectionID INTEGER, itemID INTEGER);
+            """
+        )
+        connection.executemany(
+            "INSERT INTO itemTypes (itemTypeID, typeName) VALUES (?, ?)",
+            [(1, "journalArticle")],
+        )
+        connection.executemany(
+            "INSERT INTO fields (fieldID, fieldName) VALUES (?, ?)",
+            [(1, "title"), (2, "abstractNote")],
+        )
+        connection.executemany(
+            "INSERT INTO itemDataValues (valueID, value) VALUES (?, ?)",
+            [(1, "Spatial Transcriptomics Atlas"), (2, "Tumor microenvironment analysis.")],
+        )
+        connection.execute(
+            "INSERT INTO items (itemID, dateAdded, itemTypeID) VALUES (?, ?, ?)",
+            (1, "2026-03-25 10:00:00", 1),
+        )
+        connection.executemany(
+            "INSERT INTO itemData (itemID, fieldID, valueID) VALUES (?, ?, ?)",
+            [(1, 1, 1), (1, 2, 2)],
+        )
+        connection.executemany(
+            "INSERT INTO tags (tagID, name) VALUES (?, ?)",
+            [(1, "spatial transcriptomics"), (2, "digital pathology")],
+        )
+        connection.executemany(
+            "INSERT INTO itemTags (itemID, tagID) VALUES (?, ?)",
+            [(1, 1), (1, 2)],
+        )
+        connection.execute(
+            "INSERT INTO collections (collectionID, collectionName) VALUES (?, ?)",
+            (1, "Tumor microenvironment"),
+        )
+        connection.execute(
+            "INSERT INTO collectionItems (collectionID, itemID) VALUES (?, ?)",
+            (1, 1),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def _selectbox(at: AppTest, label: str, *, key: str | None = None):
@@ -938,18 +764,11 @@ def _selectbox(at: AppTest, label: str, *, key: str | None = None):
     raise AssertionError(f"selectbox with label {label!r} and key {key!r} not found")
 
 
-def _radio(at: AppTest, label: str, *, key: str | None = None):
-    for widget in at.radio:
+def _date_input(at: AppTest, label: str, *, key: str | None = None):
+    for widget in at.date_input:
         if widget.label == label and (key is None or widget.key == key):
             return widget
-    raise AssertionError(f"radio with label {label!r} and key {key!r} not found")
-
-
-def _expander(at: AppTest, label: str):
-    for widget in at.expander:
-        if widget.label == label:
-            return widget
-    raise AssertionError(f"expander with label {label!r} not found")
+    raise AssertionError(f"date_input with label {label!r} and key {key!r} not found")
 
 
 def _button(at: AppTest, label: str):
@@ -957,44 +776,3 @@ def _button(at: AppTest, label: str):
         if widget.label == label:
             return widget
     raise AssertionError(f"button with label {label!r} not found")
-
-
-def _frontier_report_for(
-    ranked: list[RankedPaper],
-    *,
-    requested_date: date,
-    effective_date: date,
-) -> object:
-    return build_daily_frontier_report(
-        paper_pool=[item.paper for item in ranked],
-        ranked_papers=ranked,
-        requested_date=requested_date,
-        effective_date=effective_date,
-        source="arxiv",
-        mode=BIOMEDICAL_LATEST_MODE,
-        mode_label="Biomedical latest available",
-        total_fetched=len(ranked),
-    )
-
-
-def _local_ui_session(
-    *,
-    digest: DailyDigest,
-    cache_path: Path,
-    report_path: Path,
-    display_source: str,
-    recent_history: list[RunHistoryEntry] | None = None,
-    recent_history_error: str = "",
-) -> LocalUISession:
-    return LocalUISession(
-        current_run=DailyRunResult(
-            digest=digest,
-            cache_path=cache_path,
-            report_path=report_path,
-            display_source=display_source,
-            fetch_status_label="fresh source fetch" if display_source == "freshly fetched" else display_source,
-            artifact_source_label="fresh source fetch" if display_source == "freshly fetched" else display_source,
-        ),
-        recent_history=tuple(recent_history or ()),
-        recent_history_error=recent_history_error,
-    )
